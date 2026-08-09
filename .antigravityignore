@@ -1,0 +1,25 @@
+# Antigravity context ignore file
+__pycache__/
+*.log
+terminal_output.log
+test_results.log
+
+# Build & Output directories
+build/
+Build/
+Debug/
+Release/
+STM32/.metadata/
+STM32/*/.metadata/
+STM32/*/.settings/
+STM32/*/Debug/
+STM32/*/Release/
+STM32/Ultrasonik_G4_Master/Eski_PIC_Kodlari/
+esp32/build/
+esp32/.pio/
+
+# OS and Editor junk
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/

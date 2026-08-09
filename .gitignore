@@ -1,0 +1,50 @@
+# Operating System Files
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.tmp
+*.bak
+*.swp
+
+# IDE and Editor Files
+.vscode/
+.idea/
+*.launch
+
+# Python Build and Log Artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+terminal_output.log
+test_results.log
+
+# Build Directories & Compilation Artifacts
+build/
+Build/
+Debug/
+Release/
+bin/
+obj/
+
+# STM32 Specific Artifacts
+STM32/.metadata/
+STM32/*/.metadata/
+STM32/*/.settings/
+STM32/*/Debug/
+STM32/*/Release/
+STM32/Ultrasonik_G4_Master/Eski_PIC_Kodlari/
+*.elf
+*.hex
+*.bin
+*.map
+*.o
+*.d
+*.su
+*.cdep
+
+# ESP32 / PlatformIO / ESP-IDF Specific Artifacts
+esp32/build/
+esp32/.pio/
+esp32/sdkconfig.old
+esp32/managed_components/
