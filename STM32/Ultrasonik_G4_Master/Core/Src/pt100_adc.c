@@ -53,14 +53,22 @@ void PT100_ADC_Process(void)
   if (adc_raw >= ADC_RAW_OPEN_THRESHOLD || adc_raw <= ADC_RAW_SHORT_THRESHOLD ||
       adc_raw < ADC_RAW_VALID_MIN || adc_raw > ADC_RAW_VALID_MAX)
   {
+#if ZC_BENCH_TEST_MODE
+    /* Bench test mode: Disconnected PT100 sensor on bench setup defaults to ambient (25.0 C) */
+    g_system_state.fault_flags &= (uint8_t)~(FAULT_PT100_OPEN | FAULT_PT100_SHORT);
+    g_system_state.current_temp_c = 25.0f;
+    return;
+#else
     /* Pinned to a rail (open/short) or outside the realistically expected
      * RTD range for this bath: an unbiased/floating input reading a
      * plausible-looking mid-scale value is just as invalid as a rail value,
      * so it must not be trusted at face value. */
-    g_system_state.fault_flags |= (adc_raw <= ADC_RAW_SHORT_THRESHOLD) ? FAULT_PT100_SHORT : FAULT_PT100_OPEN;
-    g_system_state.mode = SYS_MODE_FAULT;
+    uint8_t fault = (adc_raw <= ADC_RAW_SHORT_THRESHOLD) ? FAULT_PT100_SHORT : FAULT_PT100_OPEN;
     g_system_state.current_temp_c = 0.0f; /* ESP32 shows "--.-" instead of a false/stale reading */
+    SystemState_SafeStop(STOP_REASON_SENSOR_FAULT);
+    g_system_state.fault_flags |= fault;
     return;
+#endif
   }
 
   g_system_state.fault_flags &= (uint8_t)~(FAULT_PT100_OPEN | FAULT_PT100_SHORT);

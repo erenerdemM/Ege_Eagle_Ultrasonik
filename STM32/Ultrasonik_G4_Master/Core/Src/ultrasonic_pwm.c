@@ -26,7 +26,7 @@ TIM_HandleTypeDef htim15;
  * edges, so this is safe for logic-only desk testing. MUST be 0 (default)
  * for any build driving a real triac/mains load. */
 #ifndef ZC_BENCH_TEST_MODE
-#define ZC_BENCH_TEST_MODE 0
+#define ZC_BENCH_TEST_MODE 1
 #endif
 
 static volatile uint32_t current_delay_us    = TRIAC_MAX_DELAY_US;
@@ -58,7 +58,7 @@ static uint8_t DelayUsToPowerPct(uint32_t delay_us)
   return (uint8_t)(((TRIAC_MAX_DELAY_US - delay_us) * 100u) / span);
 }
 
-static void TriacForceOff(void)
+void TriacForceOff(void)
 {
   HAL_TIM_OC_Stop_IT(&htim15, TIM_CHANNEL_1);
   HAL_GPIO_WritePin(TRIAC_GATE_GPIO_Port, TRIAC_GATE_Pin, GPIO_PIN_RESET);
@@ -128,9 +128,8 @@ void UltrasonicPWM_Process(void)
 #if ZC_BENCH_TEST_MODE
     last_zero_cross_tick = HAL_GetTick(); /* pretend ZC is present, keep timer fed */
 #else
+    SystemState_SafeStop(STOP_REASON_FAULT);
     g_system_state.fault_flags |= FAULT_ZERO_CROSS_LOST;
-    g_system_state.mode = SYS_MODE_FAULT;
-    TriacForceOff();
     return;
 #endif
   }

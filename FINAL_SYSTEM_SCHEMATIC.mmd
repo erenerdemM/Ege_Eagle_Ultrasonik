@@ -1,0 +1,120 @@
+graph TD
+    subgraph PC["Development PC Power Sources"]
+        USB1["USB #1 (Nucleo 5V)"]
+        USB2["USB #2 (ESP32 5V)"]
+        USB3["USB #3 (Nextion 5V)"]
+    end
+
+    subgraph STM32_NODE["STM32G474RE Node"]
+        PB10["PB10 (USART3 TX)"]
+        PB11["PB11 (USART3 RX - 5V FT)"]
+        PB1["PB1 (RS485 DE/RE)"]
+        PA0["PA0 (ADC1_IN1)"]
+        PB12["PB12 (X9C CS)"]
+        PB13["PB13 (X9C U/D)"]
+        PB14["PB14 (X9C INC)"]
+        PC7["PC7 (CN5-2 ZC Input)"]
+        PC8_11["PC8-11 (DIP SW 1-4 Inputs)"]
+        PB15["PB15 (Heater Output)"]
+        PC6["PC6 (Triac Pulse Output)"]
+        N_3V3["Nucleo 3.3V Rail"]
+        N_5V["Nucleo 5V Rail"]
+        N_GND["Nucleo GND"]
+    end
+
+    subgraph ESP32_NODE["ESP32-S3 Master Node"]
+        G8["GPIO8 (UART1 TX)"]
+        G18["GPIO18 (UART1 RX - 3.21V Max)"]
+        G5["GPIO5 (RS485 DE)"]
+        G17["GPIO17 (HMI TX)"]
+        G16["GPIO16 (HMI RX)"]
+        G4["GPIO4 (ZC_SIM 100Hz)"]
+        E_5V["ESP32 5V Rail"]
+        E_GND["ESP32 GND"]
+    end
+
+    subgraph MAX1["MAX485 #1 (STM32 Side)"]
+        M1_DI["Pin 4 (DI)"]
+        M1_RO["Pin 1 (RO)"]
+        M1_DE["Pins 2,3 (DE,/RE)"]
+        M1_VCC["Pin 8 (VCC 5V)"]
+        M1_GND["Pin 5 (GND)"]
+        M1_A["Pin 6 (A)"]
+        M1_B["Pin 7 (B)"]
+    end
+
+    subgraph MAX2["MAX485 #2 (ESP32 Side)"]
+        M2_DI["Pin 4 (DI)"]
+        M2_RO["Pin 1 (RO)"]
+        M2_DE["Pins 2,3 (DE,/RE)"]
+        M2_VCC["Pin 8 (VCC 5V)"]
+        M2_GND["Pin 5 (GND)"]
+        M2_A["Pin 6 (A)"]
+        M2_B["Pin 7 (B)"]
+    end
+
+    subgraph DIVIDER["ESP32 RX Voltage Divider"]
+        R_TOP["10kΩ Series Resistor"]
+        R_BOT["18kΩ Pulldown to GND"]
+    end
+
+    subgraph X9C["X9C103S Digital Pot"]
+        X_VCC["Pin 8 (VCC 5V)"]
+        X_VH["Pin 3 (VH 3.3V)"]
+        X_VL["Pin 6 (VL 0V)"]
+        X_VSS["Pin 4 (VSS 0V)"]
+        X_VW["Pin 5 (VW Wiper)"]
+        X_CS["Pin 7 (CS)"]
+        X_UD["Pin 2 (U/D)"]
+        X_INC["Pin 1 (INC)"]
+    end
+
+    subgraph HMI["Nextion HMI Display"]
+        H_RX["RX Wire (Yellow)"]
+        H_TX["TX Wire (Blue)"]
+        H_5V["5V Rail"]
+        H_GND["GND Wire"]
+    end
+
+    subgraph GND_BUS["Common Logic Signal GND Bus"]
+        CGND["Central 0V Reference"]
+    end
+
+    USB1 --> N_5V
+    USB2 --> E_5V
+    USB3 --> H_5V
+
+    N_GND --- CGND
+    E_GND --- CGND
+    H_GND --- CGND
+    M1_GND --- CGND
+    M2_GND --- CGND
+    X_VSS --- CGND
+    X_VL --- CGND
+
+    N_5V --> M1_VCC
+    N_5V --> X_VCC
+    E_5V --> M2_VCC
+    N_3V3 --> X_VH
+
+    PB10 --> M1_DI
+    M1_RO --> PB11
+    PB1 --> M1_DE
+
+    G8 --> M2_DI
+    M2_RO --> R_TOP --> G18
+    R_TOP --- R_BOT --- CGND
+    G5 --> M2_DE
+
+    M1_A <===>|Differential A + 120Ω| M2_A
+    M1_B <===>|Differential B + 120Ω| M2_B
+
+    G17 --> H_RX
+    H_TX --> G16
+
+    G4 -->|1kΩ Resistor| PC7
+
+    PB12 --> X_CS
+    PB13 --> X_UD
+    PB14 --> X_INC
+    X_VW -->|1kΩ Resistor| PA0

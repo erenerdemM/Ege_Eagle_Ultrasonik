@@ -6,16 +6,20 @@ Desktop.ini
 *.bak
 *.swp
 
-# IDE and Editor Files
+# IDE, Editor and Tool Files
 .vscode/
 .idea/
+.theia/
 *.launch
+.antigravityignore
 
-# Python Build and Log Artifacts
+# Python Build, Cache and Log Artifacts
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
+*.log
 terminal_output.log
 test_results.log
 
@@ -38,9 +42,11 @@ STM32/Ultrasonik_G4_Master/Eski_PIC_Kodlari/
 *.hex
 *.bin
 *.map
+*.list
 *.o
 *.d
 *.su
+*.cyclo
 *.cdep
 
 # ESP32 / PlatformIO / ESP-IDF Specific Artifacts
@@ -48,3 +54,8 @@ esp32/build/
 esp32/.pio/
 esp32/sdkconfig.old
 esp32/managed_components/
+
+# Bench-Specific Scripts and Hardware Flash Dumps (Contains Bench Credentials)
+rpi_exec.py
+flash_stm32.py
+backup_stm32/

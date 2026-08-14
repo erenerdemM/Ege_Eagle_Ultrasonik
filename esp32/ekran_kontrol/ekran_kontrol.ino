@@ -6,12 +6,39 @@
 #define RXD2 16
 #define TXD2 17
 
+// --- NEXTION COLOR CONSTANTS (TASK 1 HARDENING) ---
+#define NEXTION_COLOR_RED     63488
+#define NEXTION_COLOR_GREEN   2016
+#define NEXTION_COLOR_DEFAULT 50712
+
+// --- BUS DIAGNOSTICS ARCHITECTURE (TASK 2) ---
+struct BusDiagnostics {
+  uint32_t rx_valid_count = 0;
+  uint32_t rx_crc_error_count = 0;
+  uint32_t rx_malformed_count = 0;
+  uint32_t rx_timeout_count = 0;
+  uint32_t rx_dropped_count = 0;
+  uint32_t tx_frame_count = 0;
+  uint32_t tx_ack_count = 0;
+  uint32_t tx_nack_count = 0;
+} g_bus_diag;
+
 // --- STM32 (SLAVE) UART ---
 // GPIO26/27 kullanilmaz: ESP32-S3-N16R8 uzerinde bu pinler SPI flash hattina (SPICS1/SPIHD) sabittir.
 #define STM_RXD 18
 #define STM_TXD 8
+#define RS485_DE_PIN 5
 #define STM_BAUD 115200 // huart3 (STM32) sabit 115200; ESP32 tarafi bununla eslesmeli
 #define STM_BAGLANTI_TIMEOUT 3000
+
+void rs485Transmit(const String &msg) {
+  digitalWrite(RS485_DE_PIN, HIGH);
+  delayMicroseconds(10);
+  Serial1.print(msg);
+  Serial1.flush(); // Waits for hardware TX FIFO and shift register to flush completely
+  delayMicroseconds(5);
+  digitalWrite(RS485_DE_PIN, LOW);
+}
 
 // STM32 fault_flags bitleri (bkz. STM32/system_state.h) - PT100 acık/kısa devre tespiti icin
 #define FAULT_PT100_OPEN_BIT   0x01
@@ -43,6 +70,9 @@ int p_sicaklik[4] = {0, 40, 50, 60};
 
 String girilen_sifre = "";
 String dogru_sifre = "123456";
+bool g_service_authenticated = false;
+unsigned long service_auth_time = 0;
+const unsigned long SERVICE_SESSION_TIMEOUT_MS = 300000; // 5 minute auth timeout
 
 int guc_seviyesi = 50;       
 int kart_id = 1;             
@@ -62,17 +92,44 @@ float anlik_sicaklik[MAX_GOZ]; // STM32'den gelen gerçek sıcaklık (temp_x10/1
 int stm_fault[MAX_GOZ];
 int stm_relay[MAX_GOZ];
 int stm_pwr[MAX_GOZ];
+int stm_freq[MAX_GOZ];
+int stm_prov_state[MAX_GOZ];
 bool stm_bagli[MAX_GOZ];
 unsigned long stm_son_veri_zamani[MAX_GOZ];
 
 unsigned long sonGuncellemeZamani = 0;
 unsigned long hilWdtDebugZamani = 0;  // HIL_DEEP_DEBUG
+unsigned long sonHeartbeatZamani = 0; // Periodic heartbeat (1000ms) for STM32 RX silence watchdog
+bool hil_heartbeat_active = true;    // Production default: enabled (controllable via HIL_HEARTBEAT_OFF/ON)
 
 String gelenMesaj = "";
 String stmMesaj = "";
 String usbMesaj = "";  // HIL_TEST_MOD: PC (COM10, USB Debug) uzerinden gelen HIL komut arabellegi
 
 Preferences prefs;
+
+// Requirement 2 (Layer 1): ESP32 Master Interlock - Check if any tank is currently running
+bool isAnyTankRunning() {
+  for (int i = 1; i < MAX_GOZ; i++) {
+    if (stm_bagli[i] && (makine_calisiyor[i] || stm_relay[i] != 0)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Requirement 1 & Requirement 2 Interlock Evaluator
+bool isProvisioningAllowed() {
+  if (!g_service_authenticated) {
+    Serial.println("--> HATA: SERVIS YETKILENDIRMESI GEREKLI (g_service_authenticated == false)");
+    return false;
+  }
+  if (isAnyTankRunning()) {
+    Serial.println("--> HATA: CALISAN TANK VAR! PROVISIONING KILITLI (SYS_MODE_RUNNING INTERLOCK)");
+    return false;
+  }
+  return true;
+}
 
 // Kart (STM32 tank karti) son STM_BAGLANTI_TIMEOUT ms icinde telemetri gonderdi mi?
 bool isKartBagli(uint8_t goz_id) {
@@ -162,13 +219,187 @@ void nvsKaydet() {
 }
 
 // ==========================================
+// Phase 5.2 NVS PROVISIONING & WAL REGISTRY
+// ==========================================
+Preferences provPrefs;
+Preferences walPrefs;
+
+enum ESP32_ProvState {
+  PROV_STATE_UNCOMMISSIONED = 0x00,
+  PROV_STATE_STAGING        = 0x01,
+  PROV_STATE_ACTIVE         = 0x02
+};
+
+enum WAL_Step {
+  WAL_STEP_NONE            = 0,
+  WAL_STEP_STAGING_PENDING = 1,
+  WAL_STEP_COMMIT_PENDING  = 2
+};
+
+// Helper function: generates deterministic, collision-resistant NVS keys strictly <= 15 chars (NVS_KEY_NAME_MAX_SIZE)
+String getProvNvsKey(String uid24, const char* suffix) {
+  String s = String(suffix);
+  int maxUidLen = 15 - s.length();
+  if ((int)uid24.length() > maxUidLen) {
+    return uid24.substring(uid24.length() - maxUidLen) + s;
+  }
+  return uid24 + s;
+}
+
+// --- NVS Registry ("eagle_prov") Functions ---
+void provNvsKaydet(String uid24, int tankId, int state) {
+  provPrefs.begin("eagle_prov", false);
+  provPrefs.putInt(getProvNvsKey(uid24, "_id").c_str(), tankId);
+  provPrefs.putInt(getProvNvsKey(uid24, "_st").c_str(), state);
+  provPrefs.end();
+
+  Serial.println("DEBUG_ESP32: PROV_REGISTRY_SAVE UID=" + uid24 + " TankID=" + String(tankId) + " State=" + String(state));
+}
+
+bool provNvsOku(String uid24, int &tankId, int &state) {
+  provPrefs.begin("eagle_prov", true);
+  String keyId = getProvNvsKey(uid24, "_id");
+  String keySt = getProvNvsKey(uid24, "_st");
+  if (!provPrefs.isKey(keyId.c_str())) {
+    provPrefs.end();
+    tankId = 0;
+    state = PROV_STATE_UNCOMMISSIONED;
+    return false;
+  }
+  tankId = provPrefs.getInt(keyId.c_str(), 0);
+  state = provPrefs.getInt(keySt.c_str(), PROV_STATE_UNCOMMISSIONED);
+  provPrefs.end();
+  return true;
+}
+
+void provNvsSil(String uid24) {
+  provPrefs.begin("eagle_prov", false);
+  provPrefs.remove(getProvNvsKey(uid24, "_id").c_str());
+  provPrefs.remove(getProvNvsKey(uid24, "_st").c_str());
+  provPrefs.end();
+
+  Serial.println("DEBUG_ESP32: PROV_REGISTRY_DELETE UID=" + uid24);
+}
+
+// --- Write-Ahead Logging ("eagle_prov_wal") Functions ---
+void walYaz(int step, String uid24, int proposedId) {
+  walPrefs.begin("eagle_prov_wal", false);
+  walPrefs.putInt("step", step);
+  walPrefs.putString("uid", uid24);
+  walPrefs.putInt("id", proposedId);
+  walPrefs.end();
+
+  Serial.println("DEBUG_ESP32: WAL_WRITE step=" + String(step) + " uid=" + uid24 + " proposedId=" + String(proposedId));
+}
+
+bool walOku(int &step, String &uid24, int &proposedId) {
+  walPrefs.begin("eagle_prov_wal", true);
+  step = walPrefs.getInt("step", WAL_STEP_NONE);
+  uid24 = walPrefs.getString("uid", "");
+  proposedId = walPrefs.getInt("id", 0);
+  walPrefs.end();
+  return (step != WAL_STEP_NONE);
+}
+
+void walTemizle() {
+  walPrefs.begin("eagle_prov_wal", false);
+  walPrefs.clear();
+  walPrefs.end();
+
+  Serial.println("DEBUG_ESP32: WAL_CLEARED");
+}
+
+void walKurtar() {
+  int step = 0;
+  String uid = "";
+  int proposedId = 0;
+
+  if (walOku(step, uid, proposedId)) {
+    Serial.println("--> WAL RECOVERY DETECTED! Uncommitted transaction: step=" + String(step) + " uid=" + uid + " id=" + String(proposedId));
+    if (step == WAL_STEP_STAGING_PENDING) {
+      Serial.println("--> WAL RECOVERY: Aborting unconfirmed staging transaction for UID=" + uid);
+      rs485Transmit("T0:CANCEL_STAGE\n");
+      walTemizle();
+    } else if (step == WAL_STEP_COMMIT_PENDING) {
+      Serial.println("--> WAL RECOVERY: Retrying commit transaction for UID=" + uid + " ID=" + String(proposedId));
+      rs485Transmit("T0:ASSIGN_ID:" + String(proposedId) + ":" + uid + "\n");
+      provNvsKaydet(uid, proposedId, PROV_STATE_ACTIVE);
+      walTemizle();
+    }
+  }
+}
+
+// ==========================================
+// 3.1 DISCOVERY & ATOMIC SWAP ORCHESTRATOR
+// ==========================================
+int discoverNodes(uint16_t seedRnd = 0) {
+  if (!isProvisioningAllowed()) return 0;
+
+  String cmd = (seedRnd > 0) ? ("T0:DISCOVER:" + String(seedRnd, HEX) + "\n") : "T0:DISCOVER\n";
+  rs485Transmit(cmd);
+  Serial.println("[ESP->STM] " + cmd);
+
+  unsigned long start = millis();
+  int found = 0;
+  while (millis() - start < 600) {
+    String stmLine;
+    if (hatOku(Serial1, stmMesaj, stmLine)) {
+      if (stmLine.startsWith("DISCOVER_ACK,")) {
+        int p1 = stmLine.indexOf(',');
+        int p2 = stmLine.indexOf(',', p1 + 1);
+        if (p1 != -1 && p2 != -1) {
+          String uid = stmLine.substring(p2 + 1);
+          uid.trim();
+          if (uid.length() == 24) {
+            found++;
+            Serial.println("--> [DISCOVERY] Found UNCOMMISSIONED node UID=" + uid);
+          }
+        }
+      }
+    }
+  }
+  return found;
+}
+
+bool executeAtomicSwap(String uidA, int oldIdA, int targetIdA, String uidB, int oldIdB, int targetIdB) {
+  if (!isProvisioningAllowed()) {
+    Serial.println("--> [SWAP] ERROR: Provisioning interlock locked");
+    return false;
+  }
+
+  Serial.println("--> [SWAP] Initiating Atomic Swap: A(" + uidA + " ID " + String(oldIdA) + "->" + String(targetIdA) + ") <-> B(" + uidB + " ID " + String(oldIdB) + "->" + String(targetIdB) + ")");
+
+  // Step 1: Stage Card A (ID -> STAGING / ID=0)
+  walYaz(WAL_STEP_STAGING_PENDING, uidA, 0);
+  rs485Transmit("T" + String(oldIdA) + ":STAGE_ID:" + uidA + "\n");
+  delay(100);
+
+  // Step 2: Re-assign Card B (oldIdB -> targetIdB)
+  walYaz(WAL_STEP_COMMIT_PENDING, uidB, targetIdB);
+  rs485Transmit("T" + String(oldIdB) + ":ASSIGN_ID:" + String(targetIdB) + ":" + uidB + "\n");
+  provNvsKaydet(uidB, targetIdB, PROV_STATE_ACTIVE);
+  delay(150);
+
+  // Step 3: Re-assign Card A from STAGING (ID 0 -> targetIdA)
+  walYaz(WAL_STEP_COMMIT_PENDING, uidA, targetIdA);
+  rs485Transmit("T0:ASSIGN_ID:" + String(targetIdA) + ":" + uidA + "\n");
+  provNvsKaydet(uidA, targetIdA, PROV_STATE_ACTIVE);
+  delay(150);
+
+  // Step 4: Clear WAL transaction
+  walTemizle();
+  Serial.println("--> [SWAP] SUCCESS: Atomic Swap complete!");
+  return true;
+}
+
+// ==========================================
 // 4. STM32 UART TX (KOMUT GÖNDERME)
 // ==========================================
 // Multi-drop bus: her komut "T<mevcut_goz>:" adresiyle gonderilir; sadece o ID'ye
 // sahip STM32 karti komutu isler, digerleri sessizce yok sayar (bkz. esp32_uart.c).
 void stmGonder(String komut) {
-  String adresli = "T" + String(secili_goz) + ":" + komut;
-  Serial1.print(adresli);
+  String adresli = "T" + String(secili_goz) + ":" + komut + "\n";
+  rs485Transmit(adresli);
   String log = adresli;
   log.trim();
   Serial.println("[ESP->STM] " + log);
@@ -186,6 +417,10 @@ void stmSetPower(int yuzde) {
   stmGonder("SET_POWER:" + String(yuzde) + "\n");
 }
 
+void stmSetFreq(int freq) {
+  stmGonder("SET_FREQ:" + String(freq) + "\n");
+}
+
 void stmStart() {
   stmGonder("START\n");
 }
@@ -197,7 +432,7 @@ void stmStop() {
 // T0: bus-wide broadcast (fiziksel olarak bagli STM32, kendi mevcut ID'sinden bagimsiz olarak alir)
 void stmSetIdBroadcast(int yeniId) {
   String adresli = "T0:SET_ID:" + String(yeniId) + "\n";
-  Serial1.print(adresli);
+  rs485Transmit(adresli);
   String log = adresli;
   log.trim();
   Serial.println("[ESP->STM] " + log);
@@ -215,15 +450,12 @@ void stmSetpointleriGonder() {
 // COM10 (USB Debug) uzerinden gonderebilir; digerleri HMI komut seti (komutIsle) olarak islenir.
 bool isBusKomut(const String &s) {
   if (s.length() < 3 || s.charAt(0) != 'T') return false;
-  int i = 1;
-  while (i < (int)s.length() && isDigit(s.charAt(i))) i++;
-  return (i > 1 && i < (int)s.length() && s.charAt(i) == ':');
+  int colonIdx = s.indexOf(':');
+  return (colonIdx > 1);
 }
 
 // ==========================================
-// 5. STM32 UART RX (TELEMETRİ AYRIŞTIRMA)
-// ==========================================
-// STM32 -> ESP32: "STAT,<TankID>,<Mode>,<rem_sec>,<temp_x10>,<relay>,<pwr>,<fault>"
+// STM32 -> ESP32: "STAT,<TankID>,<Mode>,<rem_sec>,<temp_x10>,<relay>,<pwr>,<freq>,<fault>,<prov>"
 // Gelen veri HER ZAMAN kendi Tank ID'sinin dizisine yazilir (10 tank da arka planda
 // izlenir); Nextion ekran guncellemesi ise SADECE TankID, o an secili_goz (mevcut_goz)
 // ile eslesirse yapilir.
@@ -237,7 +469,9 @@ void stmTelemetryIsle(String satir) {
   int p4 = rest.indexOf(',', p3 + 1);
   int p5 = rest.indexOf(',', p4 + 1);
   int p6 = rest.indexOf(',', p5 + 1);
-  if (p1 == -1 || p2 == -1 || p3 == -1 || p4 == -1 || p5 == -1 || p6 == -1) return; // hatalı çerçeve
+  int p7 = rest.indexOf(',', p6 + 1);
+  int p8 = rest.indexOf(',', p7 + 1);
+  if (p1 == -1 || p2 == -1 || p3 == -1 || p4 == -1 || p5 == -1 || p6 == -1 || p7 == -1 || p8 == -1) return; // hatalı çerçeve
 
   int tank_id = rest.substring(0, p1).toInt();
   String mode_str = rest.substring(p1 + 1, p2);
@@ -245,7 +479,9 @@ void stmTelemetryIsle(String satir) {
   int temp_x10 = rest.substring(p3 + 1, p4).toInt();
   int relay = rest.substring(p4 + 1, p5).toInt();
   int pwr = rest.substring(p5 + 1, p6).toInt();
-  int fault = rest.substring(p6 + 1).toInt();
+  int freq = rest.substring(p6 + 1, p7).toInt();
+  int fault = rest.substring(p7 + 1, p8).toInt();
+  int prov_st = rest.substring(p8 + 1).toInt();
 
   if (tank_id < 1 || tank_id >= MAX_GOZ) return; // bozuk/gecersiz Tank ID -> dizi sinirlari disi erisim engellenir
 
@@ -254,7 +490,9 @@ void stmTelemetryIsle(String satir) {
   anlik_sicaklik[g] = temp_x10 / 10.0;
   stm_relay[g] = relay;
   stm_pwr[g] = pwr;
+  stm_freq[g] = freq;
   stm_fault[g] = fault;
+  stm_prov_state[g] = prov_st;
   makine_calisiyor[g] = (mode_str == "RUNNING");
 
   bool yeniden_baglandi = !stm_bagli[g];
@@ -290,6 +528,9 @@ void setup() {
   Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);         // Nextion HMI
   Serial1.begin(STM_BAUD, SERIAL_8N1, STM_RXD, STM_TXD); // STM32 Slave
 
+  pinMode(RS485_DE_PIN, OUTPUT);
+  digitalWrite(RS485_DE_PIN, LOW); // RX Mode initial state
+
   // Zero-cross simulator: GPIO4'te esp_timer ile surekli 100Hz kare dalga (LEDC kullanilmiyor)
   zcSimBaslat();
 
@@ -303,11 +544,14 @@ void setup() {
     stm_fault[i] = 0;
     stm_relay[i] = 0;
     stm_pwr[i] = 0;
+    stm_freq[i] = 28;
+    stm_prov_state[i] = 2;
     stm_bagli[i] = false;
     stm_son_veri_zamani[i] = 0;
   }
   
   nvsYukle();
+  walKurtar();
 
   Serial.println("[SYS] Boot... NVS setpoints yuklendi:");
   for (int i = 1; i <= 3; i++) {
@@ -408,6 +652,16 @@ void komutIsle(String komut) {
     stmStop(); // fault-ack olarak da çalışır
   }
 
+  // --- FREKANS SEÇİMİ (28 kHz / 40 kHz) ---
+  else if (komut.startsWith("CMD_FREQ|") || komut.startsWith("SET_FREQ|")) {
+    int pipe = komut.indexOf('|');
+    if (pipe != -1) {
+      int freq = komut.substring(pipe + 1).toInt();
+      stmSetFreq(freq);
+      Serial.println("--> FREKANS DEĞİŞTİRİLDİ: " + String(freq) + " kHz (Göz: " + String(secili_goz) + ")");
+    }
+  }
+
   // --- PROGRAM SEÇİMLERİ (Page 0) - Sayfa değişimi YOK, Sadece veri yükler ---
   else if (komut == "P1_SEL" || komut == "P2_SEL" || komut == "P3_SEL") {
     if (baslatmaEngelliMi()) return;
@@ -461,57 +715,57 @@ void komutIsle(String komut) {
         Serial.println("--> KAYIT BASARILI: P" + String(duzenlenen_program) + " güncellendi. (" + s_sure + " Dk / " + s_sicaklik + "C)");
         
         // Sadece yeşil animasyon yap, sayfadan çıkma (Kullanıcı isterse P2'yi de düzenlesin)
-        nextionGonder("b_save.bco=2016");
+        nextionGonder("b_save.bco=" + String(NEXTION_COLOR_GREEN));
         delay(400);
-        nextionGonder("b_save.bco=50712"); 
+        nextionGonder("b_save.bco=" + String(NEXTION_COLOR_DEFAULT));
     }
   }
 
   // --- KART/GÖZ SEÇİMİ (Page 1) ---
   else if (komut == "PAGE1_OPEN") {
-    temp_goz = secili_goz; 
-    delay(50); 
+    temp_goz = secili_goz;
+    delay(50);
     nextionGonder("t0.txt=\"" + String(temp_goz) + "\"");
     Serial.println("--> ESP32: Page 1 açıldı. Mevcut Göz (" + String(temp_goz) + ") ekrana basıldı.");
   }
   else if (komut == "UP") {
-    if (temp_goz < max_goz_sayisi) temp_goz++; 
-    nextionGonder("t0.txt=\"" + String(temp_goz) + "\""); 
-  } 
+    if (temp_goz < max_goz_sayisi) temp_goz++;
+    nextionGonder("t0.txt=\"" + String(temp_goz) + "\"");
+  }
   else if (komut == "DOWN") {
-    if (temp_goz > 1) temp_goz--; 
-    nextionGonder("t0.txt=\"" + String(temp_goz) + "\""); 
+    if (temp_goz > 1) temp_goz--;
+    nextionGonder("t0.txt=\"" + String(temp_goz) + "\"");
   }
   else if (komut == "SEL") {
-    secili_goz = temp_goz; 
-    nextionGonder("page page0"); 
-    delay(50); 
-    
+    secili_goz = temp_goz;
+    nextionGonder("page page0");
+    delay(50);
+
     // Page 0'ı YENİ SEÇİLEN GÖZÜN HAFIZASIYLA doldur
-    nextionGonder("b_goz.txt=\"Goz: " + String(secili_goz) + "\""); 
+    nextionGonder("b_goz.txt=\"Goz: " + String(secili_goz) + "\"");
     nextionGonder(String("t_set_sure.txt=\"") + (hedef_sure[secili_goz] < 10 ? "0" : "") + String(hedef_sure[secili_goz]) + "\"");
     nextionGonder("t_set_sic.txt=\"" + String(hedef_sicaklik[secili_goz]) + "\"");
 
     stmSetpointleriGonder(); // yeni seçilen gözün setpointlerini STM32'ye ilet
   }
   else if (komut == "BACK") {
-    temp_goz = secili_goz; 
+    temp_goz = secili_goz;
     nextionGonder("page page0");
   }
 
   // --- ŞİFRE VE DİĞER MENÜLER (Buralar aynı) ---
-  else if (komut.startsWith("KEY") && komut.length() == 4) {
-    char basilanTus = komut.charAt(3); 
+  else if ((komut.startsWith("KEY") && komut.length() == 4) || (komut.startsWith("KEY_") && komut.length() == 5)) {
+    char basilanTus = komut.charAt(komut.length() - 1);
     if (isDigit(basilanTus) && girilen_sifre.length() < 6) {
-      girilen_sifre += basilanTus; 
+      girilen_sifre += basilanTus;
       String yildizlar = "";
       for(int i=0; i<girilen_sifre.length(); i++) yildizlar += "*";
-      nextionGonder("t_pass.txt=\"" + yildizlar + "\""); 
+      nextionGonder("t_pass.txt=\"" + yildizlar + "\"");
     }
   }
   else if (komut == "KEY_DEL") {
     if (girilen_sifre.length() > 0) {
-      girilen_sifre.remove(girilen_sifre.length() - 1); 
+      girilen_sifre.remove(girilen_sifre.length() - 1);
       String yildizlar = "";
       for(int i=0; i<girilen_sifre.length(); i++) yildizlar += "*";
       nextionGonder("t_pass.txt=\"" + yildizlar + "\"");
@@ -519,15 +773,19 @@ void komutIsle(String komut) {
   }
   else if (komut == "KEY_OK") {
     if (girilen_sifre == dogru_sifre) {
-      girilen_sifre = ""; 
-      nextionGonder("page page5"); 
-      delay(50); 
+      girilen_sifre = "";
+      g_service_authenticated = true;
+      service_auth_time = millis();
+      nextionGonder("page page5");
+      delay(50);
       nextionGonder("t_guc.txt=\"" + String(guc_seviyesi) + "\"");
       nextionGonder("t_id.txt=\"" + String(kart_id) + "\"");
       nextionGonder("t_max.txt=\"" + String(max_goz_sayisi) + "\"");
+      Serial.println("--> SERVIS GIRISI BASARILI: g_service_authenticated = true");
     } else {
       girilen_sifre = "";
-      nextionGonder("t_pass.txt=\"HATALI!\""); 
+      g_service_authenticated = false;
+      nextionGonder("t_pass.txt=\"HATALI!\"");
     }
   }
   else if (komut == "GUC_UP") {
@@ -555,12 +813,39 @@ void komutIsle(String komut) {
     nextionGonder("t_max.txt=\"" + String(max_goz_sayisi) + "\"");
   }
   else if (komut == "SRV_SAVE") {
+    /* Requirement 1 & 2: Gating provisioning calls on ESP32 */
+    if (!isProvisioningAllowed()) {
+      nextionGonder("b_save.bco=" + String(NEXTION_COLOR_RED)); // Kirmizi (hata/reddetme)
+      g_bus_diag.tx_nack_count++;
+      return;
+    }
     nvsKaydet();
-    stmSetIdBroadcast(kart_id); // fiziksel bagli STM32'yi yeni Kart ID'sine hemen gectir
     Serial.println("--> SERVİS AYARLARI KAYDEDİLDİ!");
-    nextionGonder("b_save.bco=2016"); 
+    nextionGonder("b_save.bco=" + String(NEXTION_COLOR_GREEN));
     delay(600);
-    nextionGonder("b_save.bco=50712"); 
+    nextionGonder("b_save.bco=" + String(NEXTION_COLOR_DEFAULT));
+    g_bus_diag.tx_ack_count++;
+  }
+  else if (komut == "DIAG" || komut == "GET_DIAG") {
+    String diag_str = "DIAG,valid:" + String(g_bus_diag.rx_valid_count) +
+                       ",crc_err:" + String(g_bus_diag.rx_crc_error_count) +
+                       ",malformed:" + String(g_bus_diag.rx_malformed_count) +
+                       ",timeout:" + String(g_bus_diag.rx_timeout_count) +
+                       ",dropped:" + String(g_bus_diag.rx_dropped_count) +
+                       ",tx:" + String(g_bus_diag.tx_frame_count) +
+                       ",ack:" + String(g_bus_diag.tx_ack_count) +
+                       ",nack:" + String(g_bus_diag.tx_nack_count);
+    Serial.println("[ESP32_DIAG] " + diag_str);
+    nextionGonder("t_diag.txt=\"" + diag_str + "\"");
+  }
+  else if (komut == "HIL_HEARTBEAT_OFF") {
+    hil_heartbeat_active = false;
+    Serial.println("--> HIL_HEARTBEAT_OFF: Heartbeat paused for comm loss testing");
+  }
+  else if (komut == "HIL_HEARTBEAT_ON") {
+    hil_heartbeat_active = true;
+    sonHeartbeatZamani = millis();
+    Serial.println("--> HIL_HEARTBEAT_ON: Heartbeat resumed");
   }
 }
 
@@ -587,6 +872,12 @@ bool hatOku(Stream &kaynak, String &tampon, String &satir) {
 
 void loop() {
 
+  // --- Servis Menusu Oturum Zaman Asimi Kontrolu ---
+  if (g_service_authenticated && (millis() - service_auth_time > SERVICE_SESSION_TIMEOUT_MS)) {
+    g_service_authenticated = false;
+    Serial.println("--> SERVIS OTURUMU ZAMAN ASIMINA UGRADI (g_service_authenticated = false)");
+  }
+
   // --- Nextion'dan gelen komutlar (satir satir; ayni tick'te birikmis birden fazla komut olabilir) ---
   String satirNextion;
   while (hatOku(Serial2, gelenMesaj, satirNextion)) {
@@ -603,8 +894,18 @@ void loop() {
   while (hatOku(Serial, usbMesaj, satirUsb)) {
     if (satirUsb.length() > 0) {
       Serial.println("[PC->ESP] " + satirUsb);
+      // Provisioning bus komutlarini yetkilendirme ve SYS_MODE_RUNNING kilitlerine tabi tut
+      if (satirUsb.indexOf("STAGE_ID") != -1 || satirUsb.indexOf("ASSIGN_ID") != -1 ||
+          satirUsb.indexOf("RESET_ID") != -1 || satirUsb.indexOf("DISCOVER") != -1 ||
+          satirUsb.indexOf("SET_ID") != -1) {
+        if (!isProvisioningAllowed()) {
+          Serial.println("--> [PC->ESP] PROVISIONING REJECTED BY ESP32 INTERLOCK");
+          continue;
+        }
+      }
+
       if (isBusKomut(satirUsb)) {
-        Serial1.print(satirUsb + "\n");
+        rs485Transmit(satirUsb + "\n");
         Serial.println("[PC->STM] " + satirUsb);
       } else {
         komutIsle(satirUsb);
@@ -625,6 +926,8 @@ void loop() {
   for (int i = 1; i < MAX_GOZ; i++) {
     if (stm_bagli[i] && (millis() - stm_son_veri_zamani[i] > STM_BAGLANTI_TIMEOUT)) {
       stm_bagli[i] = false;
+      makine_calisiyor[i] = false;
+      stm_relay[i] = 0;
     }
   }
 
@@ -636,6 +939,16 @@ void loop() {
       if (stm_son_veri_zamani[i] == 0) continue; // never seen telemetry from this tank yet
       unsigned long age_ms = millis() - stm_son_veri_zamani[i];
       Serial.println("DEBUG_ESP32: WDT tank=" + String(i) + " connected=" + String(isKartBagli(i) ? 1 : 0) + " age_ms=" + String(age_ms));
+    }
+  }
+
+  // --- Periodic Heartbeat (1000ms) to prevent STM32 RX silence watchdog timeout during RUNNING ---
+  if (hil_heartbeat_active && (millis() - sonHeartbeatZamani >= 1000)) {
+    sonHeartbeatZamani = millis();
+    for (int i = 1; i < MAX_GOZ; i++) {
+      if (stm_bagli[i] && makine_calisiyor[i]) {
+        rs485Transmit("T" + String(i) + ":HEARTBEAT\n");
+      }
     }
   }
 

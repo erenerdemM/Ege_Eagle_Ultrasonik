@@ -32,6 +32,14 @@ void UltrasonicPWM_Init(void);
   */
 void UltrasonicPWM_Process(void);
 
+#define AC_HALF_CYCLE_US        10000UL     /* 50 Hz mains: 10 ms per half-cycle */
+#define TRIAC_MAX_DELAY_US      (AC_HALF_CYCLE_US - 500UL) /* 9500 us */
+
+/**
+  * @brief  Forces the Triac gate OFF immediately and stops TIM15 OC interrupt.
+  */
+void TriacForceOff(void);
+
 /* HIL_DEEP_DEBUG: current triac firing delay in microseconds (500=max power, ~9500=min power) */
 uint32_t UltrasonicPWM_GetCurrentDelayUs(void);
 

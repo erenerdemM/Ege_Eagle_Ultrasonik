@@ -19,12 +19,13 @@
   *   T0:SET_ID:<new_id 1-10>   (broadcast; also works as T<id>:SET_ID:<new_id>)
   *
   * Status telegram (STM32 -> ESP32), sent on ESP32_UART_SendStatus():
-  *   STAT,<TankID>,<mode>,<remaining_sec>,<temp_x10>,<relay>,<power_pct>,<fault_flags>\n
+  *   STAT,<TankID>,<mode>,<remaining_sec>,<temp_x10>,<relay>,<power_pct>,<frequency_khz>,<fault_flags>,<prov_state>\n
   *   temp_x10 is current_temp_c * 10 as an integer (avoids float printf).
   ******************************************************************************
   */
 #include "esp32_uart.h"
 #include "system_state.h"
+#include "x9c103s.h"
 #include "main.h"
 #include <string.h>
 #include <stdlib.h>
@@ -41,6 +42,7 @@ extern UART_HandleTypeDef hlpuart1;  // HIL_TEST_MOD: ST-Link VCP (COM11), telem
 
 #define RX_LINE_MAX  64u
 #define TX_LINE_MAX  64u
+#define RX_SILENCE_TIMEOUT_MS 3000U
 
 static uint8_t rx_byte;
 static char rx_line[RX_LINE_MAX];
@@ -50,18 +52,81 @@ static volatile uint8_t line_ready = 0;
 static char tx_line[TX_LINE_MAX];
 static volatile uint8_t tx_busy = 0;
 
+static uint32_t s_last_rx_tick_ms = 0U;
+static uint8_t s_discover_pending = 0U;
+static uint32_t s_discover_start_tick = 0U;
+static uint32_t s_discover_delay_ms = 0U;
+
+static BusDiagnostics_t g_bus_diag = {0};
+
+const BusDiagnostics_t* ESP32_UART_GetDiagnostics(void)
+{
+  return &g_bus_diag;
+}
+
 static void ProcessLine(const char *line);
+
+static void RS485_Transmit_Blocking(const uint8_t *pData, uint16_t Size, uint32_t Timeout)
+{
+  /* Guard against concurrent interrupt-driven transmission */
+  while (tx_busy)
+  {
+    /* Spin until HAL_UART_TxCpltCallback clears tx_busy */
+  }
+
+  RS485_TX_ENABLE();
+  HAL_UART_Transmit(&huart3, pData, Size, Timeout);
+  while (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_TC) == RESET)
+  {
+  }
+  RS485_RX_ENABLE();
+}
 
 void ESP32_UART_Init(void)
 {
+  RS485_RX_ENABLE();
   rx_index = 0;
   line_ready = 0;
   tx_busy = 0;
+  s_discover_pending = 0;
+  s_discover_start_tick = 0;
+  s_discover_delay_ms = 0;
+  s_last_rx_tick_ms = HAL_GetTick();
   HAL_UART_Receive_IT(&huart3, &rx_byte, 1);
+}
+
+uint32_t ESP32_UART_GetLastRxTick(void)
+{
+  return s_last_rx_tick_ms;
 }
 
 void ESP32_UART_Process(void)
 {
+  if (g_system_state.mode == SYS_MODE_RUNNING)
+  {
+    uint32_t now = HAL_GetTick();
+    if ((now - s_last_rx_tick_ms) > RX_SILENCE_TIMEOUT_MS)
+    {
+      g_bus_diag.rx_timeout_count++;
+      SystemState_SafeStop(STOP_REASON_COMM_TIMEOUT);
+    }
+  }
+
+  /* Process pending discovery response timer */
+  if (s_discover_pending != 0U && ((HAL_GetTick() - s_discover_start_tick) >= s_discover_delay_ms))
+  {
+    s_discover_pending = 0U;
+    if (g_system_state.prov_state == PROV_STATE_UNCOMMISSIONED && MY_TANK_ID == 0U)
+    {
+      char hw_uid[25];
+      SystemState_GetUID24(hw_uid);
+      char ackbuf[80];
+      int len = snprintf(ackbuf, sizeof(ackbuf), "DISCOVER_ACK,0,%s\n", hw_uid);
+      RS485_Transmit_Blocking((const uint8_t *)ackbuf, (uint16_t)len, 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ackbuf, (uint16_t)len, 10);
+    }
+  }
+
   if (!line_ready)
   {
     return;
@@ -85,23 +150,46 @@ static void ProcessLine(const char *line)
    * silently discarded so up to 10 STM32 slaves can share this bus. */
   if (line[0] != 'T')
   {
+    g_bus_diag.rx_malformed_count++;
     return;
   }
 
   long tank_id = strtol(&line[1], &endptr, 10);
   if (endptr == &line[1] || *endptr != ':')
   {
+    g_bus_diag.rx_malformed_count++;
     return; /* malformed address prefix */
   }
 
   /* T0 is a universal broadcast address, accepted regardless of MY_TANK_ID
-   * (e.g. a fresh/unknown-ID board can still be assigned via T0:SET_ID:n). */
+   * (e.g. a fresh/unknown-ID board can still be assigned via T0:SET_ID:n or T0:ASSIGN_ID:n:UID). */
   if (tank_id != 0 && (uint8_t)tank_id != MY_TANK_ID)
   {
     return; /* addressed to a different tank on the bus */
   }
 
+  /* Valid frame for this node: refresh RX watchdog tick */
+  s_last_rx_tick_ms = HAL_GetTick();
+  g_bus_diag.rx_valid_count++;
+
   const char *cmd = endptr + 1;
+
+  /* Requirement 2: Layer 2 SYS_MODE_RUNNING Interlock at STM32 Slave Level */
+  if (g_system_state.mode == SYS_MODE_RUNNING)
+  {
+    if (strncmp(cmd, "STAGE_ID", 8) == 0  ||
+        strncmp(cmd, "ASSIGN_ID", 9) == 0 ||
+        strncmp(cmd, "SET_ID:", 7) == 0   ||
+        strncmp(cmd, "RESET_ID", 8) == 0  ||
+        strncmp(cmd, "DISCOVER", 8) == 0  ||
+        strncmp(cmd, "COMMIT_ID", 9) == 0)
+    {
+      const char *err_msg = "ERR:LOCKED_SYS_RUNNING\n";
+      RS485_Transmit_Blocking((const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      return; /* REJECT IMMEDIATELY; NO FLASH TOUCH OR STATE MUTATION */
+    }
+  }
 
   if (strncmp(cmd, "SET_TIME:", 9) == 0)
   {
@@ -160,25 +248,201 @@ static void ProcessLine(const char *line)
   }
   else if (strcmp(cmd, "STOP") == 0)
   {
-    /* STOP also acts as a manual fault acknowledge/reset */
-    g_system_state.fault_flags = FAULT_NONE;
-    g_system_state.mode = SYS_MODE_IDLE;
+    /* STOP acts as manual user stop and clears active fault state */
+    SystemState_SafeStop(STOP_REASON_USER_STOP);
   }
-  else if (strncmp(cmd, "SET_ID:", 7) == 0)
+  else if (strcmp(cmd, "GET_UID") == 0)
   {
-    long new_id = strtol(&cmd[7], &endptr, 10);
-    if (endptr != &cmd[7] && new_id >= 1 && new_id <= 10)
+    char buf[64];
+    int len = snprintf(buf, sizeof(buf), "UID24:%s,PROV:%u\n", (const char *)g_system_state.uid24, (unsigned int)g_system_state.prov_state);
+    RS485_Transmit_Blocking((const uint8_t *)buf, (uint16_t)len, 10);
+    HAL_UART_Transmit(&hlpuart1, (const uint8_t *)buf, (uint16_t)len, 10);
+  }
+  else if (strncmp(cmd, "STAGE_ID", 8) == 0)
+  {
+    /* Syntax: STAGE_ID:<UID24> or STAGE_ID */
+    const char *payload_uid = (cmd[8] == ':') ? &cmd[9] : NULL;
+    char hw_uid[25];
+    SystemState_GetUID24(hw_uid);
+
+    /* Requirement 3: Byte-for-byte 24-char hex UID comparison against 0x1FFF7590 register */
+    if (payload_uid != NULL && !SystemState_VerifyUID24(payload_uid))
     {
-      /* Persists to Flash and updates MY_TANK_ID immediately; this reply
-       * telegram (and all further ones) will be stamped with the new ID. */
-      TankId_SaveOverride((uint8_t)new_id);
+      char errbuf[80];
+      int len = snprintf(errbuf, sizeof(errbuf), "NACK,STAGE_ID,ERR_UID_MISMATCH,%s\n", hw_uid);
+      RS485_Transmit_Blocking((const uint8_t *)errbuf, (uint16_t)len, 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)errbuf, (uint16_t)len, 10);
+      return;
     }
+
+    TankId_StartStaging();
+
+    char ackbuf[80];
+    int len = snprintf(ackbuf, sizeof(ackbuf), "ACK,STAGE_ID,%s\n", hw_uid);
+    RS485_Transmit_Blocking((const uint8_t *)ackbuf, (uint16_t)len, 10);
+    HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ackbuf, (uint16_t)len, 10);
+  }
+  else if (strncmp(cmd, "ASSIGN_ID:", 10) == 0)
+  {
+    /* Syntax: ASSIGN_ID:<new_id>:<UID24> */
+    long new_id = strtol(&cmd[10], &endptr, 10);
+    char hw_uid[25];
+    SystemState_GetUID24(hw_uid);
+
+    if (endptr != &cmd[10] && *endptr == ':' && new_id >= 1 && new_id <= 10)
+    {
+      const char *payload_uid = endptr + 1;
+
+      /* Requirement 3: Byte-for-byte 24-char hex UID comparison against 0x1FFF7590 register */
+      if (!SystemState_VerifyUID24(payload_uid))
+      {
+        char errbuf[80];
+        int len = snprintf(errbuf, sizeof(errbuf), "NACK,ASSIGN_ID,ERR_UID_MISMATCH,%s\n", hw_uid);
+        RS485_Transmit_Blocking((const uint8_t *)errbuf, (uint16_t)len, 10);
+        HAL_UART_Transmit(&hlpuart1, (const uint8_t *)errbuf, (uint16_t)len, 10);
+        return;
+      }
+
+      /* Requirement 4: Active state rejection - Nodes in PROV_STATE_ACTIVE reject direct ASSIGN_ID */
+      if (g_system_state.prov_state == PROV_STATE_ACTIVE)
+      {
+        char errbuf[80];
+        int len = snprintf(errbuf, sizeof(errbuf), "NACK,ASSIGN_ID,ERR_STATE_INVALID,%s\n", hw_uid);
+        RS485_Transmit_Blocking((const uint8_t *)errbuf, (uint16_t)len, 10);
+        HAL_UART_Transmit(&hlpuart1, (const uint8_t *)errbuf, (uint16_t)len, 10);
+        return;
+      }
+
+      /* Execute assignment when in PROV_STATE_UNCOMMISSIONED or PROV_STATE_STAGING */
+      if (TankId_SaveAndVerifyOverride((uint8_t)new_id, (uint8_t)PROV_STATE_ACTIVE))
+      {
+        TankId_ConfirmStaging((uint8_t)new_id);
+        char ackbuf[80];
+        int len = snprintf(ackbuf, sizeof(ackbuf), "ACK,ASSIGN_ID,%u,%s\n", (unsigned int)new_id, hw_uid);
+        RS485_Transmit_Blocking((const uint8_t *)ackbuf, (uint16_t)len, 10);
+        HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ackbuf, (uint16_t)len, 10);
+      }
+      else
+      {
+        char errbuf[80];
+        int len = snprintf(errbuf, sizeof(errbuf), "NACK,ASSIGN_ID,ERR_FLASH_VERIFY_FAIL,%s\n", hw_uid);
+        RS485_Transmit_Blocking((const uint8_t *)errbuf, (uint16_t)len, 10);
+        HAL_UART_Transmit(&hlpuart1, (const uint8_t *)errbuf, (uint16_t)len, 10);
+      }
+    }
+  }
+  else if (strncmp(cmd, "RESET_ID", 8) == 0)
+  {
+    /* Syntax: RESET_ID:<UID24> or RESET_ID */
+    const char *payload_uid = (cmd[8] == ':') ? &cmd[9] : NULL;
+    char hw_uid[25];
+    SystemState_GetUID24(hw_uid);
+
+    /* Requirement 3: Byte-for-byte 24-char hex UID comparison against 0x1FFF7590 register */
+    if (payload_uid != NULL && !SystemState_VerifyUID24(payload_uid))
+    {
+      char errbuf[80];
+      int len = snprintf(errbuf, sizeof(errbuf), "NACK,RESET_ID,ERR_UID_MISMATCH,%s\n", hw_uid);
+      RS485_Transmit_Blocking((const uint8_t *)errbuf, (uint16_t)len, 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)errbuf, (uint16_t)len, 10);
+      return;
+    }
+
+    TankId_EraseOverride();
+
+    char ackbuf[80];
+    int len = snprintf(ackbuf, sizeof(ackbuf), "ACK,RESET_ID,%s\n", hw_uid);
+    RS485_Transmit_Blocking((const uint8_t *)ackbuf, (uint16_t)len, 10);
+    HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ackbuf, (uint16_t)len, 10);
+  }
+  else if (strncmp(cmd, "DISCOVER", 8) == 0)
+  {
+    /* Requirement 1: Only UNCOMMISSIONED nodes at MY_TANK_ID == 0 respond to DISCOVER.
+     * STAGING nodes (PROV_STATE_STAGING) and ACTIVE nodes explicitly IGNORE discovery broadcasts. */
+    if (g_system_state.prov_state == PROV_STATE_UNCOMMISSIONED && MY_TANK_ID == 0U)
+    {
+      uint32_t uid_words[3];
+      uid_words[0] = HAL_GetUIDWord0();
+      uid_words[1] = HAL_GetUIDWord1();
+      uid_words[2] = HAL_GetUIDWord2();
+
+      uint16_t crc = CRC16_CCITT((const uint8_t *)uid_words, 12U);
+      uint8_t slot = (uint8_t)(crc % 16U);
+
+      uint16_t rnd_seed = 0U;
+      if (cmd[8] == ':')
+      {
+        rnd_seed = (uint16_t)strtoul(&cmd[9], NULL, 16);
+      }
+      uint16_t jitter_ms = (rnd_seed > 0U) ? ((crc ^ rnd_seed) % 15U) : 0U;
+      uint32_t delay_ms = ((uint32_t)slot * 25U) + (uint32_t)jitter_ms;
+
+      s_discover_pending = 1U;
+      s_discover_start_tick = HAL_GetTick();
+      s_discover_delay_ms = delay_ms;
+    }
+  }
+  else if (strcmp(cmd, "CANCEL_STAGE") == 0)
+  {
+    TankId_CancelStaging();
+    const char *msg = "LOG:STAGING_CANCELLED\n";
+    RS485_Transmit_Blocking((const uint8_t *)msg, (uint16_t)strlen(msg), 10);
+    HAL_UART_Transmit(&hlpuart1, (const uint8_t *)msg, (uint16_t)strlen(msg), 10);
+  }
+  else if (strncmp(cmd, "SET_FREQ:", 9) == 0)
+  {
+    long freq = strtol(&cmd[9], &endptr, 10);
+    if (endptr != &cmd[9] && (freq == 28 || freq == 40))
+    {
+      g_system_state.frequency_khz = (uint8_t)freq;
+      (void)X9C103S_SetFrequency((uint8_t)freq);
+
+      const char *log_msg = (freq == 28) ? "LOG:FREQ_28KHZ_SET_STEP_40_4KOHM\n"
+                                         : "LOG:FREQ_40KHZ_SET_STEP_90_9KOHM\n";
+      RS485_Transmit_Blocking((const uint8_t *)log_msg, (uint16_t)strlen(log_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)log_msg, (uint16_t)strlen(log_msg), 10);
+    }
+    else
+    {
+      /* Invalid frequency: transmit ERR:INVALID_FREQ and retain current frequency */
+      const char *err_msg = "ERR:INVALID_FREQ\n";
+      RS485_Transmit_Blocking((const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+    }
+  }
+  else if (strncmp(cmd, "GET_DIAG", 8) == 0 || strncmp(cmd, "DIAG", 4) == 0)
+  {
+    if (tank_id == 0)
+    {
+      return; /* Narrow guard: T0:GET_DIAG MUST NOT generate a response to avoid bus collision */
+    }
+
+    char diagbuf[128];
+    int len = snprintf(diagbuf, sizeof(diagbuf),
+                       "DIAG,%u,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+                       (unsigned int)MY_TANK_ID,
+                       (unsigned long)g_bus_diag.rx_valid_count,
+                       (unsigned long)g_bus_diag.rx_crc_error_count,
+                       (unsigned long)g_bus_diag.rx_malformed_count,
+                       (unsigned long)g_bus_diag.rx_timeout_count,
+                       (unsigned long)g_bus_diag.rx_dropped_count,
+                       (unsigned long)g_bus_diag.tx_frame_count,
+                       (unsigned long)g_bus_diag.tx_ack_count,
+                       (unsigned long)g_bus_diag.tx_nack_count);
+    RS485_Transmit_Blocking((const uint8_t *)diagbuf, (uint16_t)len, 10);
+    HAL_UART_Transmit(&hlpuart1, (const uint8_t *)diagbuf, (uint16_t)len, 10);
+    g_bus_diag.tx_ack_count++;
   }
   /* Unrecognized commands are silently ignored */
 }
 
 void ESP32_UART_SendStatus(void)
 {
+  if (MY_TANK_ID == 0U || g_system_state.prov_state != PROV_STATE_ACTIVE)
+  {
+    return; /* Telemetry suppressed for uncommissioned or staging nodes to prevent bus contention */
+  }
+
   if (tx_busy)
   {
     return; /* previous telegram still in flight, skip this cycle */
@@ -194,14 +458,16 @@ void ESP32_UART_SendStatus(void)
 
   int temp_x10 = (int)(g_system_state.current_temp_c * 10.0f);
 
-  int len = snprintf(tx_line, TX_LINE_MAX, "STAT,%u,%s,%u,%d,%u,%u,%u\n",
+  int len = snprintf(tx_line, TX_LINE_MAX, "STAT,%u,%s,%u,%d,%u,%u,%u,%u,%u\n",
                       (unsigned int)MY_TANK_ID,
                       mode_str,
                       (unsigned int)g_system_state.remaining_seconds,
                       temp_x10,
                       (unsigned int)g_system_state.relay_state,
                       (unsigned int)g_system_state.actual_power_pct,
-                      (unsigned int)g_system_state.fault_flags);
+                      (unsigned int)g_system_state.frequency_khz,
+                      (unsigned int)g_system_state.fault_flags,
+                      (unsigned int)g_system_state.prov_state);
 
   if (len <= 0)
   {
@@ -209,6 +475,8 @@ void ESP32_UART_SendStatus(void)
   }
 
   tx_busy = 1;
+  g_bus_diag.tx_frame_count++;
+  RS485_TX_ENABLE();
   HAL_UART_Transmit_IT(&huart3, (uint8_t *)tx_line, (uint16_t)len);
 
   /* HIL_TEST_MOD: mirror the same STAT telegram onto the ST-Link VCP (COM11) so the
@@ -244,6 +512,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     {
       /* line too long, discard it and resync on the next '\n' */
       rx_index = 0;
+      g_bus_diag.rx_dropped_count++;
     }
   }
   /* if line_ready is still set (previous line not yet consumed), incoming
@@ -259,6 +528,8 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
     return;
   }
 
+  /* TC flag is already handled by HAL_UART_IRQHandler before calling callback */
+  RS485_RX_ENABLE();
   tx_busy = 0;
 }
 
@@ -272,6 +543,9 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   /* Overrun/framing/noise errors abort the pending HAL_UART_Receive_IT();
    * discard the partial line and immediately re-arm so a single glitch
    * never permanently silences the link (RX must never be left dead). */
+  RS485_RX_ENABLE();
   rx_index = 0;
+  g_bus_diag.rx_dropped_count++;
+  tx_busy = 0; /* Reset TX lockup state so status transmission recovers after error */
   HAL_UART_Receive_IT(&huart3, &rx_byte, 1);
 }

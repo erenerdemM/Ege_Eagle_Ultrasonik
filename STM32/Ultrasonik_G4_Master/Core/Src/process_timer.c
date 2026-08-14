@@ -30,7 +30,7 @@ void ProcessTimer_Process(void)
     if (g_system_state.remaining_seconds == 0u)
     {
       /* 0-minute setpoint: nothing to run, auto-stop immediately */
-      g_system_state.mode = SYS_MODE_IDLE;
+      SystemState_SafeStop(STOP_REASON_TIMER_ZERO);
       mode = SYS_MODE_IDLE;
     }
   }
@@ -52,7 +52,7 @@ void ProcessTimer_Process(void)
 
     if (g_system_state.remaining_seconds == 0u)
     {
-      g_system_state.mode = SYS_MODE_IDLE; /* auto-stop */
+      SystemState_SafeStop(STOP_REASON_TIMER_ZERO); /* auto-stop */
     }
   }
 }

@@ -27,6 +27,7 @@
 #include "heater_relay.h"
 #include "ultrasonic_pwm.h"
 #include "process_timer.h"
+#include "x9c103s.h"
 #include <stdio.h>  // HIL_DEEP_DEBUG: snprintf for the COM11 debug stream
 /* USER CODE END Includes */
 
@@ -49,7 +50,7 @@ static uint32_t last_hil_debug_tick_ms = 0;  // HIL_DEEP_DEBUG
 
 /* Bench test bypass: forces MY_TANK_ID to this value and skips Flash/DIP
  * reads entirely. Set to 0 to restore normal production boot logic. */
-#define BENCH_DEV_MODE_ID 1  // Set to 0 to disable dev mode and use Flash/DIP
+#define BENCH_DEV_MODE_ID 0  // 0 = Production boot logic (Flash Page 127 override -> DIP -> UNCOMMISSIONED)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -58,6 +59,7 @@ static uint32_t last_hil_debug_tick_ms = 0;  // HIL_DEEP_DEBUG
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
 ADC_HandleTypeDef hadc2;
 
 OPAMP_HandleTypeDef hopamp3;
@@ -66,6 +68,7 @@ TIM_HandleTypeDef htim1;
 
 UART_HandleTypeDef huart3;
 UART_HandleTypeDef hlpuart1;  // HIL_TEST_MOD: ST-Link VCP (COM11) debug/telemetry echo
+IWDG_HandleTypeDef hiwdg;
 
 /* USER CODE BEGIN PV */
 /* This node's multi-drop bus address (1-10). Set at boot in main() from a
@@ -76,11 +79,13 @@ uint8_t MY_TANK_ID = 1;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_ADC1_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_OPAMP3_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_LPUART1_UART_Init(void);  // HIL_TEST_MOD: ST-Link VCP (COM11) init
+static void MX_IWDG_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -103,25 +108,51 @@ static uint8_t ReadDipSwitchId(void)
   return raw;
 }
 
-/* Returns the Flash-stored override ID (1..10), or 0 if no valid override is present. */
-uint8_t TankId_Load(void)
-{
-  uint32_t magic     = *(volatile uint32_t *)(TANK_ID_FLASH_ADDR);
-  uint32_t stored_id = *(volatile uint32_t *)(TANK_ID_FLASH_ADDR + 4U);
+#define STAGING_TIMEOUT_MS  10000U
+static uint32_t s_staging_start_tick = 0U;
+static uint8_t  s_staging_active     = 0U;
+static uint8_t  s_saved_tank_id      = 1U;
+static ProvState_t s_saved_prov_state = PROV_STATE_UNCOMMISSIONED;
 
-  if (magic == TANK_ID_MAGIC && stored_id >= 1U && stored_id <= 10U)
+/* Returns the Flash-stored override ID (1..10), or 0 if no valid override is present. */
+uint8_t TankId_Load(uint8_t *out_state)
+{
+  uint32_t magic          = *(volatile uint32_t *)(TANK_ID_FLASH_ADDR);
+  uint32_t stored_payload = *(volatile uint32_t *)(TANK_ID_FLASH_ADDR + 4U);
+
+  if (magic == TANK_ID_MAGIC)
   {
-    return (uint8_t)stored_id;
+    uint8_t id    = (uint8_t)(stored_payload & 0xFFU);
+    uint8_t state = (uint8_t)((stored_payload >> 8) & 0xFFU);
+
+    if (id >= 1U && id <= 10U)
+    {
+      if (out_state != NULL)
+      {
+        *out_state = state;
+      }
+      return id;
+    }
+  }
+
+  if (out_state != NULL)
+  {
+    *out_state = (uint8_t)PROV_STATE_UNCOMMISSIONED;
   }
   return 0U;
 }
 
-/* Erases and reprograms the Tank ID override page, then updates MY_TANK_ID live. */
-void TankId_SaveOverride(uint8_t new_id)
+/* Writes Flash Bank 2 Page 127 (0x0807F800) with 0xA5A5A5A5 magic key and performs instant readback verification. */
+uint8_t TankId_SaveAndVerifyOverride(uint8_t new_id, uint8_t state)
 {
   if (new_id < 1U || new_id > 10U)
   {
-    return;
+    return 0U;
+  }
+
+  if (g_system_state.mode == SYS_MODE_RUNNING)
+  {
+    return 0U; /* Interlock: Never modify Flash while high-voltage PWM/heating is active */
   }
 
   FLASH_EraseInitTypeDef erase_init;
@@ -129,21 +160,182 @@ void TankId_SaveOverride(uint8_t new_id)
 
   erase_init.TypeErase = FLASH_TYPEERASE_PAGES;
   erase_init.Banks     = TANK_ID_FLASH_BANK;
-  erase_init.Page       = TANK_ID_FLASH_PAGE;
-  erase_init.NbPages    = 1U;
+  erase_init.Page      = TANK_ID_FLASH_PAGE;
+  erase_init.NbPages   = 1U;
 
+  __disable_irq();
   HAL_FLASH_Unlock();
   __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
 
-  if (HAL_FLASHEx_Erase(&erase_init, &page_error) == HAL_OK)
+  if (HAL_FLASHEx_Erase(&erase_init, &page_error) != HAL_OK)
   {
-    uint64_t data = ((uint64_t)new_id << 32) | TANK_ID_MAGIC;
-    HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, TANK_ID_FLASH_ADDR, data);
+    HAL_FLASH_Lock();
+    __enable_irq();
+    __DSB();
+    return 0U;
+  }
+
+  uint32_t payload = ((uint32_t)state << 8) | (uint32_t)new_id;
+  uint64_t data = ((uint64_t)payload << 32) | (uint64_t)TANK_ID_MAGIC;
+
+  if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, TANK_ID_FLASH_ADDR, data) != HAL_OK)
+  {
+    HAL_FLASH_Lock();
+    __enable_irq();
+    __DSB();
+    return 0U;
   }
 
   HAL_FLASH_Lock();
+  __enable_irq();
+  __DSB();
 
-  MY_TANK_ID = new_id;
+  /* Instant Readback Verification */
+  uint32_t verify_magic   = *(volatile uint32_t *)(TANK_ID_FLASH_ADDR);
+  uint32_t verify_payload = *(volatile uint32_t *)(TANK_ID_FLASH_ADDR + 4U);
+
+  uint8_t readback_id    = (uint8_t)(verify_payload & 0xFFU);
+  uint8_t readback_state = (uint8_t)((verify_payload >> 8) & 0xFFU);
+
+  if (verify_magic == TANK_ID_MAGIC && readback_id == new_id && readback_state == state)
+  {
+    MY_TANK_ID = new_id;
+    g_system_state.prov_state = (ProvState_t)state;
+    return 1U;
+  }
+
+  return 0U;
+}
+
+/* Erases Flash Bank 2 Page 127, reverting Flash state to UNCOMMISSIONED */
+uint8_t TankId_EraseOverride(void)
+{
+  if (g_system_state.mode == SYS_MODE_RUNNING)
+  {
+    return 0U;
+  }
+
+  FLASH_EraseInitTypeDef erase_init;
+  uint32_t page_error = 0U;
+
+  erase_init.TypeErase = FLASH_TYPEERASE_PAGES;
+  erase_init.Banks     = TANK_ID_FLASH_BANK;
+  erase_init.Page      = TANK_ID_FLASH_PAGE;
+  erase_init.NbPages   = 1U;
+
+  __disable_irq();
+  HAL_FLASH_Unlock();
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+
+  if (HAL_FLASHEx_Erase(&erase_init, &page_error) != HAL_OK)
+  {
+    HAL_FLASH_Lock();
+    __enable_irq();
+    __DSB();
+    return 0U;
+  }
+
+  HAL_FLASH_Lock();
+  __enable_irq();
+  __DSB();
+
+  MY_TANK_ID = 0U;
+  g_system_state.prov_state = PROV_STATE_UNCOMMISSIONED;
+  return 1U;
+}
+
+/* Volatile RAM Staging logic: updates RAM state to ID=0 STAGING without erasing/writing Flash,
+ * initiating non-blocking 10,000 ms auto-timeout rollback timer. */
+void TankId_StartStaging(void)
+{
+  if (s_staging_active)
+  {
+    /* Already staging: refresh tick timer only, do NOT overwrite s_saved_tank_id */
+    s_staging_start_tick = HAL_GetTick();
+    return;
+  }
+
+  s_saved_tank_id = MY_TANK_ID;
+  s_saved_prov_state = g_system_state.prov_state;
+
+  MY_TANK_ID = 0U;
+  g_system_state.prov_state = PROV_STATE_STAGING;
+
+  s_staging_start_tick = HAL_GetTick();
+  s_staging_active = 1U;
+}
+
+void TankId_ProcessStagingTimeout(void)
+{
+  if (s_staging_active)
+  {
+    if ((HAL_GetTick() - s_staging_start_tick) >= STAGING_TIMEOUT_MS)
+    {
+      MY_TANK_ID = s_saved_tank_id;
+      g_system_state.prov_state = s_saved_prov_state;
+      s_staging_active = 0U;
+
+      const char *log_msg = "LOG:STAGING_TIMEOUT_ROLLBACK\n";
+      HAL_UART_Transmit(&huart3, (const uint8_t *)log_msg, (uint16_t)strlen(log_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)log_msg, (uint16_t)strlen(log_msg), 10);
+    }
+  }
+}
+
+void TankId_CancelStaging(void)
+{
+  if (s_staging_active)
+  {
+    MY_TANK_ID = s_saved_tank_id;
+    g_system_state.prov_state = s_saved_prov_state;
+    s_staging_active = 0U;
+  }
+}
+
+void TankId_ConfirmStaging(uint8_t final_id)
+{
+  if (s_staging_active)
+  {
+    s_staging_active = 0U;
+  }
+  (void)TankId_SaveAndVerifyOverride(final_id, (uint8_t)PROV_STATE_ACTIVE);
+}
+
+/* ====================================================================
+ * BENCH TEST DIAGNOSTIC API
+ * ==================================================================== */
+
+uint8_t HeaterTest_Readback(void)
+{
+  uint8_t expected = HAL_GPIO_ReadPin(HEATER_RELAY_GPIO_Port, HEATER_RELAY_Pin) == GPIO_PIN_SET ? 1 : 0;
+  uint8_t actual = HAL_GPIO_ReadPin(HEATER_TEST_FB_GPIO_Port, HEATER_TEST_FB_Pin) == GPIO_PIN_SET ? 1 : 0;
+  return (expected == actual) ? 1 : 0;
+}
+
+uint8_t TriacTest_Readback(void)
+{
+  uint8_t expected = HAL_GPIO_ReadPin(TRIAC_GATE_GPIO_Port, TRIAC_GATE_Pin) == GPIO_PIN_SET ? 1 : 0;
+  uint8_t actual = HAL_GPIO_ReadPin(TRIAC_TEST_FB_GPIO_Port, TRIAC_TEST_FB_Pin) == GPIO_PIN_SET ? 1 : 0;
+  return (expected == actual) ? 1 : 0;
+}
+
+static void BenchTest_Process(void)
+{
+  static uint32_t last_diagnostic_tick = 0;
+  if ((HAL_GetTick() - last_diagnostic_tick) >= 1000u)
+  {
+    last_diagnostic_tick = HAL_GetTick();
+    if (!HeaterTest_Readback())
+    {
+      char msg[] = "DIAGNOSTIC: HEATER_FEEDBACK_MISMATCH\r\n";
+      HAL_UART_Transmit(&hlpuart1, (uint8_t *)msg, sizeof(msg) - 1, 10);
+    }
+    if (!TriacTest_Readback())
+    {
+      char msg[] = "DIAGNOSTIC: TRIAC_FEEDBACK_MISMATCH\r\n";
+      HAL_UART_Transmit(&hlpuart1, (uint8_t *)msg, sizeof(msg) - 1, 10);
+    }
+  }
 }
 
 /* HIL_DEEP_DEBUG: white-box internals, printed only from the main superloop (never an ISR)
@@ -151,11 +343,15 @@ void TankId_SaveOverride(uint8_t new_id)
  * (raw ADC counts, triac firing delay, relay bit) that the STAT telegram never exposes. */
 static void HIL_DeepDebug_Print(void)
 {
-  char buf[64];
-  int len = snprintf(buf, sizeof(buf), "DEBUG_STM: ADC=%lu, DELAY=%lu, RELAY=%u\r\n",
+  char buf[128];
+  int len = snprintf(buf, sizeof(buf), "DEBUG_STM: ADC=%lu, DELAY=%lu, RELAY=%u, HEATER_OUT=%u, HEATER_FB=%u, TRIAC_OUT=%u, TRIAC_FB=%u\r\n",
                       (unsigned long)PT100_ADC_GetLastRaw(),
                       (unsigned long)UltrasonicPWM_GetCurrentDelayUs(),
-                      (unsigned int)g_system_state.relay_state);
+                      (unsigned int)g_system_state.relay_state,
+                      (unsigned int)(HAL_GPIO_ReadPin(HEATER_RELAY_GPIO_Port, HEATER_RELAY_Pin) == GPIO_PIN_SET ? 1 : 0),
+                      (unsigned int)(HAL_GPIO_ReadPin(HEATER_TEST_FB_GPIO_Port, HEATER_TEST_FB_Pin) == GPIO_PIN_SET ? 1 : 0),
+                      (unsigned int)(HAL_GPIO_ReadPin(TRIAC_GATE_GPIO_Port, TRIAC_GATE_Pin) == GPIO_PIN_SET ? 1 : 0),
+                      (unsigned int)(HAL_GPIO_ReadPin(TRIAC_TEST_FB_GPIO_Port, TRIAC_TEST_FB_Pin) == GPIO_PIN_SET ? 1 : 0));
   if (len > 0)
   {
     HAL_UART_Transmit(&hlpuart1, (uint8_t *)buf, (uint16_t)len, 10);
@@ -193,32 +389,54 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_ADC1_Init();
   MX_ADC2_Init();
   MX_OPAMP3_Init();
   MX_TIM1_Init();
   MX_USART3_UART_Init();
   MX_LPUART1_UART_Init();  // HIL_TEST_MOD: ST-Link VCP (COM11) for HIL test observability
+  MX_IWDG_Init();          // 1000 ms Hardware IWDG initialization
+
   /* USER CODE BEGIN 2 */
 
+  SystemState_Init();
+
 #if (BENCH_DEV_MODE_ID > 0)
-  /* Bench dev mode: no DIP switches wired up, so force a fixed ID and skip
-   * Flash/DIP reads. Set BENCH_DEV_MODE_ID to 0 for production builds. */
+  /* Bench dev mode: fixed ID override for single-node desktop testing */
   MY_TANK_ID = BENCH_DEV_MODE_ID;
+  g_system_state.prov_state = PROV_STATE_ACTIVE;
 #else
-  /* Flash override (if the HMI ever assigned a fixed ID via SET_ID) takes
-   * precedence over the physical DIP switch reading at boot. */
+  /* Production Boot Rule: Flash Page 127 override determines commissioning identity */
   {
-    uint8_t override_id = TankId_Load();
-    MY_TANK_ID = (override_id != 0U) ? override_id : ReadDipSwitchId();
+    uint8_t init_state = (uint8_t)PROV_STATE_UNCOMMISSIONED;
+    uint8_t override_id = TankId_Load(&init_state);
+    if (override_id >= 1U && override_id <= 10U && init_state == (uint8_t)PROV_STATE_ACTIVE)
+    {
+      MY_TANK_ID = override_id;
+      g_system_state.prov_state = PROV_STATE_ACTIVE;
+    }
+    else
+    {
+      /* Uncommissioned node: MUST boot at MY_TANK_ID = 0, PROV_STATE_UNCOMMISSIONED */
+      MY_TANK_ID = 0U;
+      g_system_state.prov_state = PROV_STATE_UNCOMMISSIONED;
+    }
   }
 #endif
 
-  SystemState_Init();
+  /* Check if reset was caused by Hardware IWDG timeout */
+  if (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST) != RESET)
+  {
+    __HAL_RCC_CLEAR_RESET_FLAGS();
+    SystemState_SafeStop(STOP_REASON_WATCHDOG_RESET);
+  }
+
   ESP32_UART_Init();
   PT100_ADC_Init();
   HeaterRelay_Init();
   UltrasonicPWM_Init();
   ProcessTimer_Init();
+  X9C103S_Init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -234,6 +452,9 @@ int main(void)
     UltrasonicPWM_Process();
     ProcessTimer_Process();
 
+    /* Check auto-timeout for volatile RAM staging rollback */
+    TankId_ProcessStagingTimeout();
+
     /* Non-blocking 500 ms telemetry heartbeat to the ESP32 (HAL_GetTick(),
      * never blocks the superloop) */
     if ((HAL_GetTick() - last_status_tick_ms) >= 500u)
@@ -248,6 +469,11 @@ int main(void)
       last_hil_debug_tick_ms = HAL_GetTick();
       HIL_DeepDebug_Print();
     }
+
+    BenchTest_Process();
+
+    /* Refresh Hardware Independent Watchdog (1000 ms timeout) */
+    HAL_IWDG_Refresh(&hiwdg);
   }
   /* USER CODE END 3 */
 }
@@ -293,6 +519,48 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC1 Initialization Function (PA0 / ADC1_IN1 X9C Wiper Voltage)
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.GainCompensation = 0;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sConfig.Channel = ADC_CHANNEL_1; /* PA0 = ADC1_IN1 */
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
   }
@@ -576,8 +844,19 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin Output Level */
+  /*Configure GPIO pin Output Level (Hold PB15, PC6, and RS485 DE LOW at reset/init) */
   HAL_GPIO_WritePin(HEATER_RELAY_GPIO_Port, HEATER_RELAY_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(TRIAC_GATE_GPIO_Port, TRIAC_GATE_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(RS485_DE_GPIO_Port, RS485_DE_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, X9C_CS_Pin | X9C_INC_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOB, X9C_UD_Pin, GPIO_PIN_RESET);
+
+  /*Configure RS485_DE_Pin (PB1) for RS485 direction control */
+  GPIO_InitStruct.Pin = RS485_DE_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(RS485_DE_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
@@ -593,6 +872,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF12_LPUART1;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+  /*Configure BENCH TEST physical loopback feedback pins (PA4, PA6) */
+  GPIO_InitStruct.Pin = HEATER_TEST_FB_Pin | TRIAC_TEST_FB_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
   /*Configure GPIO pin : LD2_Pin */
   GPIO_InitStruct.Pin = LD2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -600,12 +885,26 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : HEATER_RELAY_Pin */
+  /*Configure HEATER_RELAY_Pin (PB15) with active pull-down */
   GPIO_InitStruct.Pin = HEATER_RELAY_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure X9C_CS_Pin X9C_UD_Pin X9C_INC_Pin */
+  GPIO_InitStruct.Pin = X9C_CS_Pin | X9C_UD_Pin | X9C_INC_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(HEATER_RELAY_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure TRIAC_GATE_Pin (PC6) with active pull-down */
+  GPIO_InitStruct.Pin = TRIAC_GATE_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /*Configure GPIO pins : DIP_SW1_Pin DIP_SW2_Pin DIP_SW3_Pin DIP_SW4_Pin */
   GPIO_InitStruct.Pin = DIP_SW1_Pin|DIP_SW2_Pin|DIP_SW3_Pin|DIP_SW4_Pin;
@@ -620,6 +919,30 @@ static void MX_GPIO_Init(void)
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/**
+  * @brief IWDG Initialization Function (1000 ms timeout using 32 kHz LSI clock / 32 prescaler)
+  * @param None
+  * @retval None
+  */
+static void MX_IWDG_Init(void)
+{
+  __HAL_RCC_LSI_ENABLE();
+  while (__HAL_RCC_GET_FLAG(RCC_FLAG_LSIRDY) == RESET)
+  {
+  }
+
+  IWDG->KR = 0xCCCC; /* Enable IWDG clock domain */
+
+  hiwdg.Instance = IWDG;
+  hiwdg.Init.Prescaler = IWDG_PRESCALER_32;
+  hiwdg.Init.Reload = 1000;
+  hiwdg.Init.Window = IWDG_WINDOW_DISABLE;
+  if (HAL_IWDG_Init(&hiwdg) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
 /* USER CODE BEGIN 4 */
