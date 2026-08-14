@@ -59,3 +59,6 @@ esp32/managed_components/
 rpi_exec.py
 flash_stm32.py
 backup_stm32/
+
+# STM32 custom reproducible build output
+STM32/*/build-stm32/
