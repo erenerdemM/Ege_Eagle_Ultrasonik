@@ -28,7 +28,8 @@
 #include "ultrasonic_pwm.h"
 #include "process_timer.h"
 #include "x9c103s.h"
-#include <stdio.h>  // HIL_DEEP_DEBUG: snprintf for the COM11 debug stream
+#include <stdio.h>
+#include <string.h>  // HIL_DEEP_DEBUG: snprintf for the COM11 debug stream
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -93,8 +94,8 @@ static void MX_IWDG_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* Reads the 4 DIP switch GPIOs (active-low, pull-up) into a 1..10 Tank ID.
- * All switches open (raw 0) defaults to ID 1; raw values above 10 are clamped. */
+/* Reads the 4 DIP switch GPIOs (active-low, pull-up).
+ * Returns 1..10 for valid IDs; returns 0 for unconfigured/invalid combinations. */
 static uint8_t ReadDipSwitchId(void)
 {
   uint8_t raw = 0U;
@@ -103,9 +104,8 @@ static uint8_t ReadDipSwitchId(void)
   if (HAL_GPIO_ReadPin(DIP_SW3_GPIO_Port, DIP_SW3_Pin) == GPIO_PIN_RESET) raw |= 0x04U;
   if (HAL_GPIO_ReadPin(DIP_SW4_GPIO_Port, DIP_SW4_Pin) == GPIO_PIN_RESET) raw |= 0x08U;
 
-  if (raw == 0U) return 1U;
-  if (raw > 10U) return 10U;
-  return raw;
+  if (raw >= 1U && raw <= 10U) return raw;
+  return 0U;
 }
 
 #define STAGING_TIMEOUT_MS  10000U
@@ -417,9 +417,18 @@ int main(void)
     }
     else
     {
-      /* Uncommissioned node: MUST boot at MY_TANK_ID = 0, PROV_STATE_UNCOMMISSIONED */
-      MY_TANK_ID = 0U;
-      g_system_state.prov_state = PROV_STATE_UNCOMMISSIONED;
+      uint8_t dip_id = ReadDipSwitchId();
+
+      if (dip_id >= 1U && dip_id <= 10U)
+      {
+        MY_TANK_ID = dip_id;
+        g_system_state.prov_state = PROV_STATE_ACTIVE;
+      }
+      else
+      {
+        MY_TANK_ID = 0U;
+        g_system_state.prov_state = PROV_STATE_UNCOMMISSIONED;
+      }
     }
   }
 #endif

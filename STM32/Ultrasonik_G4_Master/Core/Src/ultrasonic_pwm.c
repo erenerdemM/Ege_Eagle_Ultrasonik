@@ -26,7 +26,7 @@ TIM_HandleTypeDef htim15;
  * edges, so this is safe for logic-only desk testing. MUST be 0 (default)
  * for any build driving a real triac/mains load. */
 #ifndef ZC_BENCH_TEST_MODE
-#define ZC_BENCH_TEST_MODE 1
+#define ZC_BENCH_TEST_MODE 0
 #endif
 
 static volatile uint32_t current_delay_us    = TRIAC_MAX_DELAY_US;
