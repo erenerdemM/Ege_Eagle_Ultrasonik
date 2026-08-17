@@ -56,7 +56,7 @@ done
 for src in "$PROJECT"/Core/Startup/*.s; do
     name="$(basename "$src" .s)"
     echo "[AS] Core/Startup/$name.s"
-    "$CC" "${CFLAGS[@]}" -c "$src" -o "$BUILD/$name.o"
+    "$CC" "${CFLAGS[@]}" -x assembler-with-cpp -c "$src" -o "$BUILD/$name.o"
 done
 
 for src in "$PROJECT"/Drivers/STM32G4xx_HAL_Driver/Src/*.c; do

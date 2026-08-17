@@ -74,6 +74,14 @@ void SystemState_Init(void)
   g_system_state.setpoint_temp_c       = 0.0f;
   g_system_state.setpoint_power_pct    = 0;
 
+  g_system_state.degas_config.duration_minutes = 15U;
+  g_system_state.degas_config.power_pct        = 100U;
+  g_system_state.degas_config.frequency_khz    = 28U;
+  g_system_state.degas_config.pulse_on_ms      = 1000U;
+  g_system_state.degas_config.pulse_off_ms     = 500U;
+  g_system_state.degas_config.temp_ctrl        = 0U;
+  g_system_state.degas_config.target_temp_c    = 50.0f;
+
   g_system_state.current_temp_c    = 0.0f;
   g_system_state.remaining_seconds = 0;
   g_system_state.relay_state       = 0;
@@ -95,8 +103,12 @@ void SystemState_SafeStop(StopReason_t reason)
   switch (reason)
   {
     case STOP_REASON_USER_STOP:
-      g_system_state.mode              = SYS_MODE_IDLE;
-      g_system_state.fault_flags       = FAULT_NONE;
+      /* Retain FAULT mode and fault flags if currently in fault state; otherwise transition to IDLE */
+      if (g_system_state.mode != SYS_MODE_FAULT)
+      {
+        g_system_state.mode        = SYS_MODE_IDLE;
+        g_system_state.fault_flags = FAULT_NONE;
+      }
       g_system_state.remaining_seconds = 0u;
       break;
 

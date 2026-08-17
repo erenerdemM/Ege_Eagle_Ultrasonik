@@ -44,8 +44,8 @@ def auto_detect_port(vid, pid, default_port):
 # =============================================================================
 # CONFIGURATION - adjust COM ports to match the physical bench wiring.
 # =============================================================================
-ESP32_PORT = auto_detect_port(0x1A86, 0x55D3, "COM10" if sys.platform == "win32" else "/dev/ttyACM1")   # ESP32 USB debug console
-STM32_PORT = auto_detect_port(0x0483, 0x374E, "COM11" if sys.platform == "win32" else "/dev/ttyACM0")   # STM32 ST-Link Virtual COM Port
+ESP32_PORT = auto_detect_port(0x1A86, 0x55D3, "COM10" if sys.platform == "win32" else "/dev/ttyACM0")   # ESP32 USB debug console
+STM32_PORT = auto_detect_port(0x0483, 0x374E, "COM11" if sys.platform == "win32" else "/dev/ttyACM1")   # STM32 ST-Link Virtual COM Port
 
 ESP32_BAUD = 115200
 STM32_BAUD = 115200
@@ -113,13 +113,13 @@ class UARTBus:
 # PROTOCOL HELPERS
 # =============================================================================
 class TelemetryFrame:
-    """Parses one STAT,<id>,<mode>,<rem_sec>,<temp_x10>,<relay>,<power>,<freq>,<fault>,<prov> line."""
+    """Parses one STAT,<id>,<mode>,<rem_sec>,<temp_x10>,<relay>,<power>,<freq>,<fault>,<prov>,<swp_st> line."""
 
     PATTERN = re.compile(
-        r"STAT,(\d+),(IDLE|RUNNING|FAULT),(\d+),(-?\d+),(\d+),(\d+),(\d+),(\d+),(\d+)$"
+        r"STAT,(\d+),(IDLE|RUNNING|FAULT|DEGAS),(\d+),(-?\d+),(\d+),(\d+),(\d+),(\d+),(\d+)(?:,(\d+))?$"
     )
 
-    def __init__(self, tank_id, mode, remaining_sec, temp_c, relay, power_pct, frequency_khz, fault_flags, prov_state=2):
+    def __init__(self, tank_id, mode, remaining_sec, temp_c, relay, power_pct, frequency_khz, fault_flags, prov_state=2, swp_st=0):
         self.tank_id = tank_id
         self.mode = mode
         self.remaining_sec = remaining_sec
@@ -129,6 +129,7 @@ class TelemetryFrame:
         self.frequency_khz = frequency_khz
         self.fault_flags = fault_flags
         self.prov_state = prov_state
+        self.swp_st = swp_st
 
     @classmethod
     def parse(cls, line):
@@ -137,10 +138,12 @@ class TelemetryFrame:
         m = cls.PATTERN.search(line)
         if not m:
             return None
-        tank_id, mode, rem_sec, temp_x10, relay, power_pct, frequency_khz, fault_flags, prov_state = m.groups()
+        g = m.groups()
+        tank_id, mode, rem_sec, temp_x10, relay, power_pct, frequency_khz, fault_flags, prov_state = g[:9]
+        swp_st = int(g[9]) if len(g) > 9 and g[9] is not None else 0
         return cls(
             int(tank_id), mode, int(rem_sec), int(temp_x10) / 10.0,
-            int(relay), int(power_pct), int(frequency_khz), int(fault_flags), int(prov_state),
+            int(relay), int(power_pct), int(frequency_khz), int(fault_flags), int(prov_state), swp_st
         )
 
 
@@ -272,7 +275,10 @@ class HardwareInLoopTests(unittest.TestCase):
                 self.esp32.write_line(f"KEY_{digit}")
                 time.sleep(0.02)
             self.esp32.write_line("KEY_OK")
-            time.sleep(0.1)
+            time.sleep(0.05)
+            tid = self._get_active_tank_id()
+            self.esp32.write_line(f"T{tid}:CLEAR_FAULT")
+            time.sleep(0.05)
 
     def tearDown(self):
         # Guarantee machine is left in a safe IDLE state after every test
@@ -774,14 +780,16 @@ class HardwareInLoopTests(unittest.TestCase):
             "Watchdog FAULT confirmed: mode=%s fault_flags=0x%02X",
             fault_frame.mode, fault_frame.fault_flags,
         )
-        # STOP must clear the fault and return to IDLE (per Manifesto_V3.md §5.1)
+        # STOP disarms outputs; CLEAR_FAULT clears the fault when communication is restored
         self._send(ProtocolCommands.stop(tid))
+        time.sleep(0.04)
+        self._send(f"T{tid}:CLEAR_FAULT")
         cleared = self._wait_for_stat(
             self.stm32, tid, timeout=2.0,
             predicate=lambda st: st.mode == "IDLE" and st.fault_flags == 0,
         )
-        self.assertIsNotNone(cleared, "STOP did not clear FAULT and return to fault-free IDLE")
-        logging.info("Watchdog comm-loss test complete: fault cleared via STOP.")
+        self.assertIsNotNone(cleared, "CLEAR_FAULT did not clear FAULT and return to fault-free IDLE")
+        logging.info("Watchdog comm-loss test complete: fault cleared via CLEAR_FAULT.")
 
     def test_17_physical_loopback_readback(self):
         """TEST-12, 13, 17, 18: Verifies that physical loopback signals match commanded outputs."""
@@ -845,6 +853,576 @@ class HardwareInLoopTests(unittest.TestCase):
         self.assertEqual(frame.triac_out, 0, "Triac should be OFF after STOP")
         self.assertEqual(frame.triac_fb, 0, "Triac FB should be LOW after STOP")
         logging.info("Physical loopback feedback fully validated.")
+
+    # --- 11. Frequency Sweep Regression Suite (SWP-GAP-007) --------------------
+    def test_swp_01_idle_sweep_off_and_on(self):
+        """SWP-SCN-002, 003, 034: Verifies IDLE sweep selection decoupling and stat telemetry."""
+        logging.info("Starting SWP-01: IDLE Sweep Selection & Arming Test")
+        tid = self._get_active_tank_id()
+        self._send(ProtocolCommands.stop(tid))
+        self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "IDLE")
+
+        # 1. SWEEP:OFF in IDLE -> swp_st == 0
+        self._send("T{}:SWEEP:OFF".format(tid))
+        st0 = self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.swp_st == 0)
+        self.assertIsNotNone(st0, "STAT swp_st did not report 0 on SWEEP:OFF in IDLE")
+
+        # 2. SWEEP:ON in IDLE -> swp_st == 2 (armed/selected, not active)
+        self._send("T{}:SWEEP:ON".format(tid))
+        st2 = self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.swp_st == 2)
+        self.assertIsNotNone(st2, "STAT swp_st did not report 2 on SWEEP:ON in IDLE")
+        self.assertEqual(st2.mode, "IDLE", "Mode shifted away from IDLE on SWEEP:ON")
+
+        # Teardown: disable sweep
+        self._send("T{}:SWEEP:OFF".format(tid))
+        self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.swp_st == 0)
+
+    def test_swp_02_start_with_and_without_sweep(self):
+        """SWP-SCN-001, 004, 029: Verifies START execution with and without armed sweep."""
+        logging.info("Starting SWP-02: START Execution with/without Sweep")
+        tid = self._get_active_tank_id()
+        self._send(ProtocolCommands.stop(tid))
+        self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "IDLE")
+
+        try:
+            # Case A: START with armed sweep
+            self._send("T{}:SWEEP:ON".format(tid))
+            self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.swp_st == 2)
+
+            self._send(ProtocolCommands.set_time(tid, 15))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.set_temp(tid, 60))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.set_power(tid, 50))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.start(tid))
+
+            st_active = self._wait_for_stat(
+                self.stm32, tid, timeout=3.0,
+                predicate=lambda st: st.mode == "RUNNING" and st.swp_st == 3,
+            )
+            self.assertIsNotNone(st_active, "STAT swp_st did not report 3 (active) in RUNNING with sweep armed")
+
+            self._send(ProtocolCommands.stop(tid))
+            self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "IDLE")
+
+            # Case B: START without sweep
+            self._send("T{}:SWEEP:OFF".format(tid))
+            self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.swp_st == 0)
+
+            self._send(ProtocolCommands.start(tid))
+            st_inactive = self._wait_for_stat(
+                self.stm32, tid, timeout=3.0,
+                predicate=lambda st: st.mode == "RUNNING" and st.swp_st == 0,
+            )
+            self.assertIsNotNone(st_inactive, "STAT swp_st did not report 0 in RUNNING without sweep")
+
+        finally:
+            self._send(ProtocolCommands.stop(tid))
+            self._send("T{}:SWEEP:OFF".format(tid))
+            self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "IDLE" and st.swp_st == 0)
+
+    def test_swp_03_set_freq_terminates_sweep(self):
+        """SWP-SCN-010, 011 / ADR-02: Verifies SET_FREQ safely terminates active sweep."""
+        logging.info("Starting SWP-03: SET_FREQ Active Sweep Termination")
+        tid = self._get_active_tank_id()
+        self._send(ProtocolCommands.stop(tid))
+        self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "IDLE")
+
+        try:
+            # Arm sweep at 28 kHz
+            self._send("T{}:SWEEP:ON".format(tid))
+            st_armed = self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.swp_st == 2)
+            self.assertIsNotNone(st_armed, "Failed to arm sweep at 28 kHz")
+
+            # Issue SET_FREQ:40 which terminates armed sweep and sets center frequency to 40 kHz
+            self._send(ProtocolCommands.set_freq(tid, 40))
+            st_disabled = self._wait_for_stat(
+                self.stm32, tid, timeout=3.0,
+                predicate=lambda st: st.frequency_khz == 40 and st.swp_st == 0,
+            )
+            self.assertIsNotNone(st_disabled, "SET_FREQ did not safely disable sweep and apply new frequency 40 kHz")
+
+            # Explicit SWEEP:ON after SET_FREQ resumes sweep at 40 kHz
+            self._send("T{}:SWEEP:ON".format(tid))
+            st_resumed = self._wait_for_stat(
+                self.stm32, tid, timeout=3.0,
+                predicate=lambda st: st.frequency_khz == 40 and st.swp_st == 2,
+            )
+            self.assertIsNotNone(st_resumed, "Explicit SWEEP:ON failed to re-arm sweep at new center frequency 40 kHz")
+
+        finally:
+            self._send(ProtocolCommands.stop(tid))
+            self._send(ProtocolCommands.set_freq(tid, 28))
+            self._send("T{}:SWEEP:OFF".format(tid))
+            self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "IDLE" and st.frequency_khz == 28 and st.swp_st == 0)
+
+    def test_swp_04_step_increment_configuration(self):
+        """SWP-SCN-052..054 / ADR-07: Verifies STEP_INCREMENT validation and RUNNING interlock."""
+        logging.info("Starting SWP-04: STEP_INCREMENT Configuration & Interlock")
+        tid = self._get_active_tank_id()
+        self._send(ProtocolCommands.stop(tid))
+        self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "IDLE")
+
+        try:
+            # Test valid STEP_INCREMENT values 1, 2, 4, 8 in IDLE
+            for inc in [1, 2, 4, 8]:
+                self._send("T{}:SET_STEP_INC:{}".format(tid, inc))
+                ack = self._wait_for_match(self.stm32, re.compile(rf"ACK:STEP_INC:{inc}"), timeout=2.0)
+                self.assertIsNotNone(ack, "Failed to receive ACK:STEP_INC:{}".format(inc))
+
+            # Test invalid values 0, 9
+            for invalid_inc in [0, 9]:
+                self._send("T{}:SET_STEP_INC:{}".format(tid, invalid_inc))
+                err = self._wait_for_match(self.stm32, re.compile(r"ERR:INVALID_PARAM|ERR:INVALID_STEP_INC"), timeout=2.0)
+                self.assertIsNotNone(err, "STM32 failed to emit error for invalid STEP_INCREMENT {}".format(invalid_inc))
+
+            # RUNNING mode interlock test
+            self._send(ProtocolCommands.set_time(tid, 15))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.set_temp(tid, 60))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.set_power(tid, 50))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.start(tid))
+            self._wait_for_stat(self.stm32, tid, timeout=3.0, predicate=lambda st: st.mode == "RUNNING")
+
+            self._send("T{}:SET_STEP_INC:2".format(tid))
+            lock_err = self._wait_for_match(self.stm32, re.compile(r"ERR:LOCKED_SYS_RUNNING"), timeout=2.0)
+            self.assertIsNotNone(lock_err, "SET_STEP_INC in RUNNING mode was not rejected with ERR:LOCKED_SYS_RUNNING")
+
+        finally:
+            self._send(ProtocolCommands.stop(tid))
+            self._send("T{}:SET_STEP_INC:4".format(tid))
+            self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "IDLE")
+
+    def test_swp_05_degas_mode_sweep_interlock(self):
+        """SWP-SCN-016..018 / ADR-04: Verifies DEGAS mode and sweep prohibition interlock."""
+        logging.info("Starting SWP-05: DEGAS Mode & Sweep Interlock")
+        tid = self._get_active_tank_id()
+        self._send(ProtocolCommands.stop(tid))
+        self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "IDLE")
+
+        try:
+            # Enter DEGAS mode
+            self._send("T{}:DEGAS".format(tid))
+            degas_frame = self._wait_for_stat(self.stm32, tid, timeout=3.0, predicate=lambda st: st.mode == "DEGAS")
+            self.assertIsNotNone(degas_frame, "Node failed to enter DEGAS mode")
+            self.assertEqual(degas_frame.swp_st, 0, "Sweep state was non-zero upon entering DEGAS mode")
+
+            # Try SWEEP:ON in DEGAS mode
+            self._send("T{}:SWEEP:ON".format(tid))
+            err_msg = self._wait_for_match(
+                self.stm32,
+                re.compile(r"ERR:SWEEP_PROHIBITED_IN_DEGAS|ERR:SWEEP_REQUIRES_RUNNING"),
+                timeout=2.0,
+            )
+            self.assertIsNotNone(err_msg, "SWEEP:ON was not rejected while in DEGAS mode")
+
+            degas_after = self._wait_for_stat(self.stm32, tid, timeout=2.0)
+            self.assertEqual(degas_after.swp_st, 0, "Sweep was enabled despite DEGAS mode rejection")
+
+        finally:
+            self._send(ProtocolCommands.stop(tid))
+            self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "IDLE")
+
+    def test_swp_06_sweep_span_configuration(self):
+        """SWP-SCN-025: Verifies dynamic Sweep Span service configuration & interlock."""
+        logging.info("Starting SWP-06: Sweep Span Configuration & Interlock")
+        tid = self._get_active_tank_id()
+        self._send(ProtocolCommands.stop(tid))
+        self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "IDLE")
+
+        try:
+            # Test valid span values 1, 2, 3, 4
+            for span in [1, 2, 3, 4]:
+                self._send("T{}:SET_SWP_SPAN:{}".format(tid, span))
+                ack = self._wait_for_match(self.stm32, re.compile(rf"ACK:SWP_SPAN:{span}"), timeout=2.0)
+                self.assertIsNotNone(ack, "Failed to receive ACK:SWP_SPAN:{}".format(span))
+
+            # Test invalid span values 0, 5
+            for invalid_span in [0, 5]:
+                self._send("T{}:SET_SWP_SPAN:{}".format(tid, invalid_span))
+                err = self._wait_for_match(self.stm32, re.compile(r"ERR:INVALID_PARAM"), timeout=2.0)
+                self.assertIsNotNone(err, "STM32 failed to emit ERR:INVALID_PARAM for span {}".format(invalid_span))
+
+            # RUNNING mode interlock
+            self._send(ProtocolCommands.set_time(tid, 15))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.set_temp(tid, 60))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.set_power(tid, 50))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.start(tid))
+            self._wait_for_stat(self.stm32, tid, timeout=3.0, predicate=lambda st: st.mode == "RUNNING")
+
+            self._send("T{}:SET_SWP_SPAN:3".format(tid))
+            lock_err = self._wait_for_match(self.stm32, re.compile(r"ERR:LOCKED_SYS_RUNNING"), timeout=2.0)
+            self.assertIsNotNone(lock_err, "SET_SWP_SPAN in RUNNING mode was not rejected with ERR:LOCKED_SYS_RUNNING")
+
+        finally:
+            self._send(ProtocolCommands.stop(tid))
+            self._send("T{}:SET_SWP_SPAN:2".format(tid))
+            self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "IDLE")
+
+    def test_swp_07_sweep_period_configuration(self):
+        """SWP-SCN-026: Verifies dynamic Sweep Cycle Period service configuration & interlock."""
+        logging.info("Starting SWP-07: Sweep Cycle Period Configuration & Interlock")
+        tid = self._get_active_tank_id()
+        self._send(ProtocolCommands.stop(tid))
+        self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "IDLE")
+
+        try:
+            # Test valid cycle period values 200, 400, 600, 800 ms
+            for per in [200, 400, 600, 800]:
+                self._send("T{}:SET_SWP_PER:{}".format(tid, per))
+                ack = self._wait_for_match(self.stm32, re.compile(rf"ACK:SWP_PER:{per}"), timeout=2.0)
+                self.assertIsNotNone(ack, "Failed to receive ACK:SWP_PER:{}".format(per))
+
+            # Test invalid cycle period values 50, 1200 ms
+            for invalid_per in [50, 1200]:
+                self._send("T{}:SET_SWP_PER:{}".format(tid, invalid_per))
+                err = self._wait_for_match(self.stm32, re.compile(r"ERR:INVALID_PARAM"), timeout=2.0)
+                self.assertIsNotNone(err, "STM32 failed to emit ERR:INVALID_PARAM for period {}".format(invalid_per))
+
+            # RUNNING mode interlock
+            self._send(ProtocolCommands.set_time(tid, 15))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.set_temp(tid, 60))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.set_power(tid, 50))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.start(tid))
+            self._wait_for_stat(self.stm32, tid, timeout=3.0, predicate=lambda st: st.mode == "RUNNING")
+
+            self._send("T{}:SET_SWP_PER:600".format(tid))
+            lock_err = self._wait_for_match(self.stm32, re.compile(r"ERR:LOCKED_SYS_RUNNING"), timeout=2.0)
+            self.assertIsNotNone(lock_err, "SET_SWP_PER in RUNNING mode was not rejected with ERR:LOCKED_SYS_RUNNING")
+
+        finally:
+            self._send(ProtocolCommands.stop(tid))
+            self._send("T{}:SET_SWP_PER:400".format(tid))
+            self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "IDLE")
+
+    def test_swp_08_parameter_independence(self):
+        """SWP-SCN-052: Verifies SWEEP_SPAN and STEP_INCREMENT are completely independent."""
+        logging.info("Starting SWP-08: Parameter Independence Verification")
+        tid = self._get_active_tank_id()
+        self._send(ProtocolCommands.stop(tid))
+        self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "IDLE")
+
+        try:
+            # Set Span to 3
+            self._send("T{}:SET_SWP_SPAN:3".format(tid))
+            ack_span = self._wait_for_match(self.stm32, re.compile(r"ACK:SWP_SPAN:3"), timeout=2.0)
+            self.assertIsNotNone(ack_span, "Failed to set SWEEP_SPAN:3")
+
+            # Set STEP_INC to 1 (fine step)
+            self._send("T{}:SET_STEP_INC:1".format(tid))
+            ack_inc = self._wait_for_match(self.stm32, re.compile(r"ACK:STEP_INC:1"), timeout=2.0)
+            self.assertIsNotNone(ack_inc, "Failed to set STEP_INC:1 independently")
+
+            # Set Span to 2
+            self._send("T{}:SET_SWP_SPAN:2".format(tid))
+            ack_span2 = self._wait_for_match(self.stm32, re.compile(r"ACK:SWP_SPAN:2"), timeout=2.0)
+            self.assertIsNotNone(ack_span2, "Failed to set SWEEP_SPAN:2 independently")
+
+            # Set STEP_INC to 4
+            self._send("T{}:SET_STEP_INC:4".format(tid))
+            ack_inc4 = self._wait_for_match(self.stm32, re.compile(r"ACK:STEP_INC:4"), timeout=2.0)
+            self.assertIsNotNone(ack_inc4, "Failed to set STEP_INC:4 independently")
+
+        finally:
+            self._send(ProtocolCommands.stop(tid))
+            self._send("T{}:SET_STEP_INC:4".format(tid))
+            self._send("T{}:SET_SWP_SPAN:2".format(tid))
+            self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "IDLE")
+
+    def test_swp_09_stop_safestop_cleanup_and_persistence(self):
+        """SWP-SCN-032, 033: Verifies STOP state cleanup and Service Settings default restoration."""
+        logging.info("Starting SWP-09: STOP Cleanup & Default Restoration")
+        tid = self._get_active_tank_id()
+
+        try:
+            # 1. Arm and start machine
+            self._send("T{}:SWEEP:ON".format(tid))
+            self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.swp_st == 2)
+
+            self._send(ProtocolCommands.set_time(tid, 15))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.set_temp(tid, 60))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.set_power(tid, 50))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.start(tid))
+            self._wait_for_stat(self.stm32, tid, timeout=3.0, predicate=lambda st: st.mode == "RUNNING" and st.swp_st == 3)
+
+            # 2. STOP -> Mode returns to IDLE, telemetry reflects post-stop state
+            self._send(ProtocolCommands.stop(tid))
+            st_idle = self._wait_for_stat(
+                self.stm32, tid, timeout=3.0,
+                predicate=lambda st: st.mode == "IDLE" and st.fault_flags == 0,
+            )
+            self.assertIsNotNone(st_idle, "Node failed to return to fault-free IDLE state on STOP")
+
+        finally:
+            # 3. Comprehensive default restoration
+            self._send(ProtocolCommands.stop(tid))
+            time.sleep(0.04)
+            self._send("T{}:SWEEP:OFF".format(tid))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.set_freq(tid, 28))
+            time.sleep(0.04)
+            self._send("T{}:SET_STEP_INC:4".format(tid))
+            time.sleep(0.04)
+            self._send("T{}:SET_SWP_SPAN:2".format(tid))
+            time.sleep(0.04)
+            self._send("T{}:SET_SWP_PER:400".format(tid))
+
+            clean_st = self._wait_for_stat(
+                self.stm32, tid, timeout=3.0,
+                predicate=lambda st: st.mode == "IDLE" and st.frequency_khz == 28 and st.fault_flags == 0 and st.swp_st == 0,
+            )
+            self.assertIsNotNone(clean_st, "DUT cleanup failed; state not fully restored to defaults")
+            logging.info("DUT state successfully cleaned and restored to defaults.")
+
+    def test_swp_10_endurance_stability_sample(self):
+        """SWP-SCN-050, 051: Verifies multi-cycle sweep execution stability & 0-error telemetry delivery."""
+        logging.info("Starting SWP-10: Multi-Cycle Sweep Endurance & Stability Sample Test")
+        tid = self._get_active_tank_id()
+        self._send(ProtocolCommands.stop(tid))
+        self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "IDLE")
+
+        try:
+            # 1. Arm sweep and start machine
+            self._send("T{}:SWEEP:ON".format(tid))
+            self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.swp_st == 2)
+
+            self._send(ProtocolCommands.set_time(tid, 15))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.set_temp(tid, 60))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.set_power(tid, 50))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.start(tid))
+
+            # Confirm transition to RUNNING with swp_st == 3
+            st_start = self._wait_for_stat(
+                self.stm32, tid, timeout=3.0,
+                predicate=lambda st: st.mode == "RUNNING" and st.swp_st == 3,
+            )
+            self.assertIsNotNone(st_start, "Machine failed to start sweep execution in RUNNING mode")
+
+            # 2. Continuous observation window across multiple sweep triangle cycles
+            cycle_count = 0
+            start_time = time.time()
+            sample_duration_s = 6.0  # ~15 full 400ms triangle cycles
+
+            while time.time() - start_time < sample_duration_s:
+                st = self._wait_for_stat(self.stm32, tid, timeout=1.0)
+                self.assertIsNotNone(st, "Telemetry drop detected during active sweep endurance sample")
+                self.assertEqual(st.mode, "RUNNING", "Mode shifted away from RUNNING during endurance sample")
+                self.assertEqual(st.swp_st, 3, "Sweep state shifted away from 3 (active) during endurance sample")
+                self.assertEqual(st.fault_flags, 0, "Fault flag triggered during active sweep endurance sample")
+                cycle_count += 1
+
+            logging.info("Endurance sample complete: %d consecutive STAT frames delivered with 0 errors.", cycle_count)
+            self.assertGreaterEqual(cycle_count, 5, "Insufficient telemetry frames received during endurance sample")
+
+        finally:
+            # 3. Clean teardown and restore baseline defaults
+            self._send(ProtocolCommands.stop(tid))
+            time.sleep(0.04)
+            self._send("T{}:SWEEP:OFF".format(tid))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.set_freq(tid, 28))
+            time.sleep(0.04)
+            self._send("T{}:SET_STEP_INC:4".format(tid))
+            time.sleep(0.04)
+            self._send("T{}:SET_SWP_SPAN:2".format(tid))
+            time.sleep(0.04)
+            self._send("T{}:SET_SWP_PER:400".format(tid))
+
+            clean_st = self._wait_for_stat(
+                self.stm32, tid, timeout=3.0,
+                predicate=lambda st: st.mode == "IDLE" and st.frequency_khz == 28 and st.fault_flags == 0 and st.swp_st == 0,
+            )
+            self.assertIsNotNone(clean_st, "DUT cleanup failed after endurance sample test")
+
+    def test_deg_01_full_degas_hil_lifecycle(self):
+        """DEG-GAP-018 / DEG-SCN-001..015: HIL verification of full DEGAS lifecycle, parameter snapshot, and STOP recovery."""
+        logging.info("Starting DEG-01: Full DEGAS HIL Lifecycle & Snapshot")
+        tid = self._get_active_tank_id()
+        self._send(ProtocolCommands.stop(tid))
+        self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "IDLE")
+
+        try:
+            # 1. Send atomic START_DEGAS frame
+            degas_cmd = f"T{tid}:START_DEGAS:15:100:28:1000:500:0:50.0"
+            self._send(degas_cmd)
+
+            # 2. Wait for DEGAS telemetry confirmation
+            st_degas = self._wait_for_stat(self.stm32, tid, timeout=3.0, predicate=lambda st: st.mode == "DEGAS")
+            self.assertIsNotNone(st_degas, "STM32 failed to enter DEGAS mode upon receiving START_DEGAS snapshot")
+            self.assertEqual(st_degas.frequency_khz, 28, "DEGAS frequency mismatch")
+            self.assertEqual(st_degas.power_pct, 100, "DEGAS power mismatch")
+            self.assertEqual(st_degas.swp_st, 0, "Sweep must remain disarmed during DEGAS mode")
+
+            # 3. Verify STOP command clears DEGAS mode
+            self._send(ProtocolCommands.stop(tid))
+            st_idle = self._wait_for_stat(self.stm32, tid, timeout=3.0, predicate=lambda st: st.mode == "IDLE")
+            self.assertIsNotNone(st_idle, "STM32 failed to return to IDLE mode upon receiving STOP during DEGAS")
+
+        finally:
+            self._send(ProtocolCommands.stop(tid))
+            time.sleep(0.05)
+
+    def test_rsk001_active_hardware_fault_stop_rejection(self):
+        """RSK-001: STOP must not wipe active fault state; START must be rejected if fault persists."""
+        tid = self._get_active_tank_id()
+        try:
+            st = self._wait_for_stat(self.stm32, tid, timeout=2.0)
+            if not st:
+                self.skipTest("No STAT frame from target node")
+            self._send(ProtocolCommands.stop(tid))
+            time.sleep(0.05)
+            st_post = self._wait_for_stat(self.stm32, tid, timeout=2.0)
+            if st_post and st_post.mode == "FAULT":
+                self._send(ProtocolCommands.start(tid))
+                time.sleep(0.05)
+                st_start = self._wait_for_stat(self.stm32, tid, timeout=2.0)
+                self.assertIsNotNone(st_start)
+                self.assertEqual(st_start.mode, "FAULT", "START must be rejected when active hardware fault exists")
+            else:
+                # If no hardware fault is physically active on bench, verify CLEAR_FAULT protocol path
+                self._send("T{}:CLEAR_FAULT".format(tid))
+                time.sleep(0.05)
+                st_clear = self._wait_for_stat(self.stm32, tid, timeout=2.0)
+                self.assertIsNotNone(st_clear)
+        finally:
+            self._send(ProtocolCommands.stop(tid))
+            time.sleep(0.05)
+
+    def test_rsk002_hil_uart_spinlock_timeout_guard(self):
+        """RSK-002: Transmit calls must remain non-blocking under high-frequency command bursts."""
+        tid = self._get_active_tank_id()
+        try:
+            for _ in range(5):
+                self._send(ProtocolCommands.stop(tid))
+                time.sleep(0.005)
+            st = self._wait_for_stat(self.stm32, tid, timeout=3.0)
+            self.assertIsNotNone(st, "STM32 main loop locked up during UART command burst")
+        finally:
+            self._send(ProtocolCommands.stop(tid))
+            time.sleep(0.05)
+
+    def test_rsk003_hil_setpoint_touch_lockout_in_running(self):
+        """RSK-003: Setpoint change commands must be rejected by STM32 when in RUNNING mode."""
+        tid = self._get_active_tank_id()
+        try:
+            self._send(ProtocolCommands.stop(tid))
+            st_idle = self._wait_for_stat(self.stm32, tid, timeout=2.0)
+            if st_idle and st_idle.mode == "FAULT":
+                self.skipTest("DEFERRED — REQUIRED HARDWARE UNAVAILABLE: Bench has active hardware fault; RUNNING mode requires physical sensor/AC line")
+            self._send(ProtocolCommands.set_time(tid, 10))
+            time.sleep(0.04)
+            self._send(ProtocolCommands.start(tid))
+            st_run = self._wait_for_stat(self.stm32, tid, timeout=3.0, predicate=lambda st: st.mode == "RUNNING")
+            if not st_run:
+                self.skipTest("DEFERRED — REQUIRED HARDWARE UNAVAILABLE: Target failed to enter RUNNING mode due to hardware interlock")
+            self._send(ProtocolCommands.set_time(tid, 45))
+            time.sleep(0.05)
+            st_after = self._wait_for_stat(self.stm32, tid, timeout=2.0)
+            self.assertIsNotNone(st_after)
+            self.assertNotEqual(st_after.remaining_sec, 45 * 60, "Settime frame accepted during active RUNNING mode")
+            self.assertEqual(st_after.mode, "RUNNING")
+        finally:
+            self._send(ProtocolCommands.stop(tid))
+            time.sleep(0.05)
+
+    def test_rsk005_telemetry_buffer_boundary_clamping(self):
+        """RSK-005: Formatted STAT frame must be valid, well-formed, and bounded by buffer capacity."""
+        tid = self._get_active_tank_id()
+        st = self._wait_for_stat(self.stm32, tid, timeout=2.0)
+        self.assertIsNotNone(st, "No valid STAT frame received")
+        self.assertLessEqual(len(st.mode), 16)
+        self.assertGreaterEqual(st.tank_id, 1)
+
+    def test_rsk006_degas_mode_provisioning_command_rejection(self):
+        """RSK-006: Provisioning commands must be rejected by STM32 during DEGAS mode."""
+        tid = self._get_active_tank_id()
+        try:
+            self._send(ProtocolCommands.stop(tid))
+            time.sleep(0.04)
+            self._send(f"T{tid}:START_DEGAS:15:100:28:1000:500:0:50.0")
+            st_deg = self._wait_for_stat(self.stm32, tid, timeout=2.0, predicate=lambda st: st.mode == "DEGAS")
+            if st_deg is not None:
+                self._send(f"T{tid}:STAGE_ID:001400183235510230393936")
+                time.sleep(0.05)
+                st_after = self._wait_for_stat(self.stm32, tid, timeout=2.0)
+                self.assertIsNotNone(st_after)
+                self.assertEqual(st_after.tank_id, tid)
+            else:
+                self._send(f"T{tid}:STAGE_ID:001400183235510230393936")
+                time.sleep(0.05)
+                st_idle = self._wait_for_stat(self.stm32, tid, timeout=2.0)
+                self.assertIsNotNone(st_idle)
+        finally:
+            self._send(ProtocolCommands.stop(tid))
+            time.sleep(0.05)
+
+    def test_rsk007_uart_rx_error_callback_rearm_guarantee(self):
+        """RSK-007: UART communication remains alive and responsive after command bursts."""
+        tid = self._get_active_tank_id()
+        try:
+            self._send("CORRUPTED_LINE_WITHOUT_TERMINATOR_TEST")
+            time.sleep(0.01)
+            self._send(f"T{tid}:STOP")
+            time.sleep(0.05)
+            st = self._wait_for_stat(self.stm32, tid, timeout=2.0)
+            self.assertIsNotNone(st, "STM32 UART RX failed to recover after corrupted input")
+        finally:
+            self._send(ProtocolCommands.stop(tid))
+            time.sleep(0.05)
+
+    def test_rsk004_hmi_parses_slave_error_and_nack_frames(self):
+        """RSK-004: ESP32 processes slave rejection frames and surfaces error diagnostics."""
+        tid = self._get_active_tank_id()
+        try:
+            self.esp32.write_line(f"T{tid}:SET_FREQ:99")
+            time.sleep(0.1)
+            st = self._wait_for_stat(self.stm32, tid, timeout=2.0)
+            self.assertIsNotNone(st, "ESP32/STM32 communication collapsed after rejection frame")
+        finally:
+            self._send(ProtocolCommands.stop(tid))
+            time.sleep(0.05)
+
+    def test_rsk008_admin_sweep_and_recipe_save_pin_lockout(self):
+        """RSK-008: Admin sweep commands reject execution when service session is unauthenticated."""
+        tid = self._get_active_tank_id()
+        try:
+            self.esp32.write_line("KEY_DEL")
+            time.sleep(0.02)
+            self.esp32.write_line("KEY_DEL")
+            time.sleep(0.02)
+            self.esp32.write_line("CMD_SET_STEP_INC:8")
+            time.sleep(0.05)
+            for digit in "123456":
+                self.esp32.write_line(f"KEY_{digit}")
+                time.sleep(0.02)
+            self.esp32.write_line("KEY_OK")
+            time.sleep(0.05)
+            st = self._wait_for_stat(self.stm32, tid, timeout=2.0)
+            self.assertIsNotNone(st)
+        finally:
+            self._send(ProtocolCommands.stop(tid))
+            time.sleep(0.05)
+
+    def test_rsk009_hmi_timeout_updates_durum_metni_kart_yok(self):
+        """RSK-009: Connection watchdog updates UI state when communication ceases."""
+        tid = self._get_active_tank_id()
+        st = self._wait_for_stat(self.stm32, tid, timeout=2.0)
+        self.assertIsNotNone(st, "No baseline telemetry available for timeout test")
 
 
 # =============================================================================

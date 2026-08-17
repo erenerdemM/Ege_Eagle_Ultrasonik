@@ -22,6 +22,8 @@ __pycache__/
 *.log
 terminal_output.log
 test_results.log
+logs/
+scratch/__pycache__/
 
 # Build Directories & Compilation Artifacts
 build/

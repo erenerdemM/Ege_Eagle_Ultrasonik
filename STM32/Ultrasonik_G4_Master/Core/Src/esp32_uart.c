@@ -68,18 +68,50 @@ static void ProcessLine(const char *line);
 
 static void RS485_Transmit_Blocking(const uint8_t *pData, uint16_t Size, uint32_t Timeout)
 {
-  /* Guard against concurrent interrupt-driven transmission */
-  while (tx_busy)
+  if (pData == NULL || Size == 0U)
   {
-    /* Spin until HAL_UART_TxCpltCallback clears tx_busy */
+    return;
   }
 
-  RS485_TX_ENABLE();
-  HAL_UART_Transmit(&huart3, pData, Size, Timeout);
-  while (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_TC) == RESET)
+  /* Guard 1: Timeout-bounded check against stuck/stale background interrupt transmission */
+  uint32_t wait_start = HAL_GetTick();
+  while (tx_busy)
   {
+    if ((HAL_GetTick() - wait_start) >= Timeout)
+    {
+      tx_busy = 0; /* Force clear lockup */
+      g_bus_diag.tx_nack_count++;
+      break;
+    }
   }
+
+  /* Claim TX lock */
+  tx_busy = 1;
+
+  RS485_TX_ENABLE();
+  HAL_StatusTypeDef status = HAL_UART_Transmit(&huart3, (uint8_t *)pData, Size, Timeout);
+
+  if (status == HAL_OK)
+  {
+    /* Guard 2: Timeout-bounded wait for UART Transmission Complete (TC) flag */
+    uint32_t tc_start = HAL_GetTick();
+    while (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_TC) == RESET)
+    {
+      if ((HAL_GetTick() - tc_start) >= Timeout)
+      {
+        g_bus_diag.tx_nack_count++;
+        break;
+      }
+    }
+  }
+  else
+  {
+    g_bus_diag.tx_nack_count++;
+  }
+
+  /* Always restore transceiver to RX mode and release TX lock */
   RS485_RX_ENABLE();
+  tx_busy = 0;
 }
 
 void ESP32_UART_Init(void)
@@ -102,7 +134,7 @@ uint32_t ESP32_UART_GetLastRxTick(void)
 
 void ESP32_UART_Process(void)
 {
-  if (g_system_state.mode == SYS_MODE_RUNNING)
+  if (g_system_state.mode == SYS_MODE_RUNNING || g_system_state.mode == SYS_MODE_DEGAS)
   {
     uint32_t now = HAL_GetTick();
     if ((now - s_last_rx_tick_ms) > RX_SILENCE_TIMEOUT_MS)
@@ -174,8 +206,23 @@ static void ProcessLine(const char *line)
 
   const char *cmd = endptr + 1;
 
-  /* Requirement 2: Layer 2 SYS_MODE_RUNNING Interlock at STM32 Slave Level */
-  if (g_system_state.mode == SYS_MODE_RUNNING)
+  /* Layer 2 Active Mode Interlock at STM32 Slave Level */
+  if (g_system_state.mode == SYS_MODE_RUNNING || g_system_state.mode == SYS_MODE_DEGAS)
+  {
+    if (strncmp(cmd, "SET_TIME:", 9) == 0  ||
+        strncmp(cmd, "SET_TEMP:", 9) == 0  ||
+        strncmp(cmd, "SET_POWER:", 10) == 0 ||
+        strncmp(cmd, "SET_FREQ:", 9) == 0)
+    {
+      const char *err_msg = "ERR:LOCKED_ACTIVE_MODE\n";
+      RS485_Transmit_Blocking((const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      return;
+    }
+  }
+
+  /* Requirement 2: Layer 2 SYS_MODE_RUNNING and SYS_MODE_DEGAS Interlock at STM32 Slave Level */
+  if (g_system_state.mode == SYS_MODE_RUNNING || g_system_state.mode == SYS_MODE_DEGAS)
   {
     if (strncmp(cmd, "STAGE_ID", 8) == 0  ||
         strncmp(cmd, "ASSIGN_ID", 9) == 0 ||
@@ -191,6 +238,40 @@ static void ProcessLine(const char *line)
     }
   }
 
+  if (strcmp(cmd, "SWEEP:ON") == 0)
+  {
+    if (g_system_state.mode == SYS_MODE_DEGAS)
+    {
+      const char *err_msg = "ERR:SWEEP_PROHIBITED_IN_DEGAS\n";
+      RS485_Transmit_Blocking((const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      return;
+    }
+    if (g_system_state.mode == SYS_MODE_FAULT)
+    {
+      const char *err_msg = "ERR:INVALID_SYS_MODE\n";
+      RS485_Transmit_Blocking((const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      return;
+    }
+    X9C103S_SetSweepEnabled(1U);
+    {
+      const char *ack_msg = "ACK:SWEEP:ON,PERIOD_MS=400,SPAN=+-2KHZ\n";
+      RS485_Transmit_Blocking((const uint8_t *)ack_msg, (uint16_t)strlen(ack_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ack_msg, (uint16_t)strlen(ack_msg), 10);
+    }
+    return;
+  }
+  else if (strcmp(cmd, "SWEEP:OFF") == 0)
+  {
+    X9C103S_SetSweepEnabled(0U);
+    {
+      const char *ack_msg = "ACK:SWEEP:OFF,CENTER_RESTORED\n";
+      RS485_Transmit_Blocking((const uint8_t *)ack_msg, (uint16_t)strlen(ack_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ack_msg, (uint16_t)strlen(ack_msg), 10);
+    }
+    return;
+  }
   if (strncmp(cmd, "SET_TIME:", 9) == 0)
   {
     long minutes = strtol(&cmd[9], &endptr, 10);
@@ -241,15 +322,115 @@ static void ProcessLine(const char *line)
   }
   else if (strcmp(cmd, "START") == 0)
   {
-    if (g_system_state.mode != SYS_MODE_FAULT)
+    if (g_system_state.mode == SYS_MODE_FAULT)
+    {
+      const char *err_msg = "NACK,ERR_FAULT_ACTIVE\n";
+      RS485_Transmit_Blocking((const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+    }
+    else
     {
       g_system_state.mode = SYS_MODE_RUNNING;
+      if (X9C103S_IsSweepEnabled() != 0U)
+      {
+        /* If sweep was armed in IDLE, trigger endpoint positioning upon entering RUNNING */
+        X9C103S_SetSweepEnabled(1U);
+      }
+    }
+  }
+  else if (strncmp(cmd, "START_DEGAS", 11) == 0 || strcmp(cmd, "DEGAS") == 0 || strcmp(cmd, "MODE:DEGAS") == 0)
+  {
+    if (g_system_state.mode != SYS_MODE_FAULT)
+    {
+      if (cmd[11] == ':')
+      {
+        /* Parameterized snapshot frame: START_DEGAS:<dur>:<pwr>:<freq>:<on>:<off>:<t_ctrl>:<t_target> */
+        unsigned int dur = 0, pwr = 0, freq = 0, on = 0, off = 0, t_ctrl = 0;
+        float t_target = 0.0f;
+        int parsed = sscanf(cmd + 12, "%u:%u:%u:%u:%u:%u:%f", &dur, &pwr, &freq, &on, &off, &t_ctrl, &t_target);
+
+        if (parsed == 7)
+        {
+          /* Software boundary validation */
+          if (dur >= 1u && dur <= 120u &&
+              pwr >= 10u && pwr <= 100u &&
+              freq >= 28u && freq <= 40u &&
+              on >= 100u && on <= 10000u &&
+              off <= 10000u &&
+              (off == 0u || off >= 100u) &&
+              t_ctrl <= 1u &&
+              t_target >= 20.0f && t_target <= 90.0f)
+          {
+            g_system_state.degas_config.duration_minutes = (uint16_t)dur;
+            g_system_state.degas_config.power_pct        = (uint8_t)pwr;
+            g_system_state.degas_config.frequency_khz    = (uint8_t)freq;
+            g_system_state.degas_config.pulse_on_ms      = (uint16_t)on;
+            g_system_state.degas_config.pulse_off_ms     = (uint16_t)off;
+            g_system_state.degas_config.temp_ctrl        = (uint8_t)t_ctrl;
+            g_system_state.degas_config.target_temp_c    = t_target;
+
+            X9C103S_SetSweepEnabled(0U);
+            g_system_state.mode = SYS_MODE_DEGAS;
+          }
+          /* Out-of-bounds parameters are safely rejected without mode change */
+        }
+      }
+      else if (cmd[11] == '\0' || strcmp(cmd, "DEGAS") == 0 || strcmp(cmd, "MODE:DEGAS") == 0)
+      {
+        /* Parameterless command: use existing volatile degas_config defaults */
+        X9C103S_SetSweepEnabled(0U);
+        g_system_state.mode = SYS_MODE_DEGAS;
+      }
+    }
+    else
+    {
+      const char *err_msg = "NACK,ERR_FAULT_ACTIVE\n";
+      RS485_Transmit_Blocking((const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
     }
   }
   else if (strcmp(cmd, "STOP") == 0)
   {
-    /* STOP acts as manual user stop and clears active fault state */
+    /* STOP acts as manual user stop and disarms outputs without wiping fault flags if faulted */
     SystemState_SafeStop(STOP_REASON_USER_STOP);
+  }
+  else if (strcmp(cmd, "CLEAR_FAULT") == 0 || strcmp(cmd, "FAULT_CLEAR") == 0)
+  {
+    if (g_system_state.mode == SYS_MODE_FAULT)
+    {
+      uint8_t persistent_hardware_fault = 0U;
+
+      /* Evaluate if PT100 ADC is currently out of valid hardware bounds */
+      if ((g_system_state.fault_flags & (FAULT_PT100_OPEN | FAULT_PT100_SHORT)) != 0U)
+      {
+        if (g_system_state.current_temp_c < -20.0f || g_system_state.current_temp_c > 150.0f)
+        {
+          persistent_hardware_fault = 1U;
+        }
+      }
+
+      if (persistent_hardware_fault != 0U)
+      {
+        const char *err_msg = "NACK:FAULT_PERSISTENT\n";
+        RS485_Transmit_Blocking((const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+        HAL_UART_Transmit(&hlpuart1, (const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      }
+      else
+      {
+        g_system_state.fault_flags = FAULT_NONE;
+        g_system_state.mode        = SYS_MODE_IDLE;
+        const char *ack_msg = "ACK:FAULT_CLEARED\n";
+        RS485_Transmit_Blocking((const uint8_t *)ack_msg, (uint16_t)strlen(ack_msg), 10);
+        HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ack_msg, (uint16_t)strlen(ack_msg), 10);
+        ESP32_UART_SendStatus();
+      }
+    }
+    else
+    {
+      const char *ack_msg = "ACK:NO_FAULT\n";
+      RS485_Transmit_Blocking((const uint8_t *)ack_msg, (uint16_t)strlen(ack_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ack_msg, (uint16_t)strlen(ack_msg), 10);
+    }
   }
   else if (strcmp(cmd, "GET_UID") == 0)
   {
@@ -394,6 +575,9 @@ static void ProcessLine(const char *line)
     long freq = strtol(&cmd[9], &endptr, 10);
     if (endptr != &cmd[9] && (freq == 28 || freq == 40))
     {
+      /* SWP-GAP-001 / ADR-02 / SWP-REQ-009: Frequency change terminates any active sweep state */
+      X9C103S_SetSweepEnabled(0U);
+
       g_system_state.frequency_khz = (uint8_t)freq;
       (void)X9C103S_SetFrequency((uint8_t)freq);
 
@@ -406,6 +590,86 @@ static void ProcessLine(const char *line)
     {
       /* Invalid frequency: transmit ERR:INVALID_FREQ and retain current frequency */
       const char *err_msg = "ERR:INVALID_FREQ\n";
+      RS485_Transmit_Blocking((const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+    }
+  }
+  else if (strncmp(cmd, "SET_STEP_INC:", 13) == 0)
+  {
+    if (g_system_state.mode == SYS_MODE_RUNNING)
+    {
+      const char *err_msg = "ERR:LOCKED_SYS_RUNNING\n";
+      RS485_Transmit_Blocking((const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      return;
+    }
+
+    long val = strtol(&cmd[13], &endptr, 10);
+    if (endptr != &cmd[13] && val >= 1 && val <= 8)
+    {
+      (void)X9C103S_SetStepIncrement((uint8_t)val);
+      char ackbuf[40];
+      int len = snprintf(ackbuf, sizeof(ackbuf), "ACK:STEP_INC:%u\n", (unsigned int)val);
+      RS485_Transmit_Blocking((const uint8_t *)ackbuf, (uint16_t)len, 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ackbuf, (uint16_t)len, 10);
+    }
+    else
+    {
+      const char *err_msg = "ERR:INVALID_PARAM\n";
+      RS485_Transmit_Blocking((const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+    }
+  }
+  else if (strncmp(cmd, "SET_SWP_SPAN:", 13) == 0 || strncmp(cmd, "SET_SPAN:", 9) == 0)
+  {
+    if (g_system_state.mode == SYS_MODE_RUNNING)
+    {
+      const char *err_msg = "ERR:LOCKED_SYS_RUNNING\n";
+      RS485_Transmit_Blocking((const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      return;
+    }
+
+    const char *p = (strncmp(cmd, "SET_SWP_SPAN:", 13) == 0) ? &cmd[13] : &cmd[9];
+    long val = strtol(p, &endptr, 10);
+    if (endptr != p && val >= 1 && val <= 4)
+    {
+      (void)X9C103S_SetSweepSpan((uint8_t)val);
+      char ackbuf[40];
+      int len = snprintf(ackbuf, sizeof(ackbuf), "ACK:SWP_SPAN:%u\n", (unsigned int)val);
+      RS485_Transmit_Blocking((const uint8_t *)ackbuf, (uint16_t)len, 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ackbuf, (uint16_t)len, 10);
+    }
+    else
+    {
+      const char *err_msg = "ERR:INVALID_PARAM\n";
+      RS485_Transmit_Blocking((const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+    }
+  }
+  else if (strncmp(cmd, "SET_SWP_PER:", 12) == 0 || strncmp(cmd, "SET_PER:", 8) == 0)
+  {
+    if (g_system_state.mode == SYS_MODE_RUNNING)
+    {
+      const char *err_msg = "ERR:LOCKED_SYS_RUNNING\n";
+      RS485_Transmit_Blocking((const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      return;
+    }
+
+    const char *p = (strncmp(cmd, "SET_SWP_PER:", 12) == 0) ? &cmd[12] : &cmd[8];
+    long val = strtol(p, &endptr, 10);
+    if (endptr != p && val >= 100 && val <= 1000)
+    {
+      (void)X9C103S_SetSweepPeriod((uint16_t)val);
+      char ackbuf[40];
+      int len = snprintf(ackbuf, sizeof(ackbuf), "ACK:SWP_PER:%u\n", (unsigned int)val);
+      RS485_Transmit_Blocking((const uint8_t *)ackbuf, (uint16_t)len, 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ackbuf, (uint16_t)len, 10);
+    }
+    else
+    {
+      const char *err_msg = "ERR:INVALID_PARAM\n";
       RS485_Transmit_Blocking((const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
       HAL_UART_Transmit(&hlpuart1, (const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
     }
@@ -452,26 +716,40 @@ void ESP32_UART_SendStatus(void)
   switch (g_system_state.mode)
   {
     case SYS_MODE_RUNNING: mode_str = "RUNNING"; break;
+    case SYS_MODE_DEGAS:   mode_str = "DEGAS";   break;
     case SYS_MODE_FAULT:   mode_str = "FAULT";   break;
     default:                mode_str = "IDLE";    break;
   }
 
   int temp_x10 = (int)(g_system_state.current_temp_c * 10.0f);
 
-  int len = snprintf(tx_line, TX_LINE_MAX, "STAT,%u,%s,%u,%d,%u,%u,%u,%u,%u\n",
+  uint8_t sweep_enabled = X9C103S_IsSweepEnabled();
+  uint8_t sweep_active = (sweep_enabled != 0U && g_system_state.mode == SYS_MODE_RUNNING) ? 1U : 0U;
+  uint8_t swp_st = (uint8_t)((sweep_enabled << 1U) | sweep_active);
+
+  uint8_t current_freq = (g_system_state.mode == SYS_MODE_DEGAS) ? g_system_state.degas_config.frequency_khz : g_system_state.frequency_khz;
+
+  int len = snprintf(tx_line, TX_LINE_MAX, "STAT,%u,%s,%u,%d,%u,%u,%u,%u,%u,%u\n",
                       (unsigned int)MY_TANK_ID,
                       mode_str,
                       (unsigned int)g_system_state.remaining_seconds,
                       temp_x10,
                       (unsigned int)g_system_state.relay_state,
                       (unsigned int)g_system_state.actual_power_pct,
-                      (unsigned int)g_system_state.frequency_khz,
+                      (unsigned int)current_freq,
                       (unsigned int)g_system_state.fault_flags,
-                      (unsigned int)g_system_state.prov_state);
+                      (unsigned int)g_system_state.prov_state,
+                      (unsigned int)swp_st);
 
   if (len <= 0)
   {
     return;
+  }
+
+  if (len >= TX_LINE_MAX)
+  {
+    len = TX_LINE_MAX - 1;
+    tx_line[len] = '\0';
   }
 
   tx_busy = 1;
@@ -540,6 +818,13 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     return;
   }
 
+  /* Clear all UART error flags (Overrun, Noise, Framing, Parity) */
+  __HAL_UART_CLEAR_OREFLAG(huart);
+  __HAL_UART_CLEAR_NEFLAG(huart);
+  __HAL_UART_CLEAR_FEFLAG(huart);
+  __HAL_UART_CLEAR_PEFLAG(huart);
+  huart->ErrorCode = HAL_UART_ERROR_NONE;
+
   /* Overrun/framing/noise errors abort the pending HAL_UART_Receive_IT();
    * discard the partial line and immediately re-arm so a single glitch
    * never permanently silences the link (RX must never be left dead). */
@@ -547,5 +832,11 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   rx_index = 0;
   g_bus_diag.rx_dropped_count++;
   tx_busy = 0; /* Reset TX lockup state so status transmission recovers after error */
-  HAL_UART_Receive_IT(&huart3, &rx_byte, 1);
+
+  if (HAL_UART_Receive_IT(&huart3, &rx_byte, 1) != HAL_OK)
+  {
+    /* If re-arm failed due to state lock, force abort receive and re-arm deterministically */
+    (void)HAL_UART_AbortReceive(&huart3);
+    (void)HAL_UART_Receive_IT(&huart3, &rx_byte, 1);
+  }
 }

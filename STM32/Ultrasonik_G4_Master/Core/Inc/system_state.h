@@ -18,7 +18,8 @@ typedef enum
 {
   SYS_MODE_IDLE = 0,
   SYS_MODE_RUNNING,
-  SYS_MODE_FAULT
+  SYS_MODE_FAULT,
+  SYS_MODE_DEGAS
 } SystemMode_t;
 
 typedef enum
@@ -50,10 +51,24 @@ typedef enum
 
 typedef struct
 {
+  uint16_t duration_minutes; /* Process duration in minutes (prototype default: 15 min) */
+  uint8_t  power_pct;        /* Ultrasonic power percentage in DEGAS (prototype default: 100 %) */
+  uint8_t  frequency_khz;    /* Base center frequency in DEGAS (prototype default: 28 kHz) */
+  uint16_t pulse_on_ms;      /* Ultrasonic ON pulse duration in ms (prototype default: 1000 ms) */
+  uint16_t pulse_off_ms;     /* Ultrasonic OFF silent duration in ms (prototype default: 500 ms) */
+  uint8_t  temp_ctrl;        /* 0 = OFF (heater forced OFF in DEGAS), 1 = ON */
+  float    target_temp_c;    /* Target temperature for DEGAS when temp_ctrl == 1 (prototype default: 50.0 °C) */
+} DegasConfig_t;
+
+typedef struct
+{
   /* Setpoints - written by esp32_uart.c on command reception */
   uint16_t setpoint_time_minutes;
   float    setpoint_temp_c;
   uint8_t  setpoint_power_pct;
+
+  /* DEGAS coherent runtime configuration snapshot */
+  DegasConfig_t degas_config;
 
   /* Live process values - written by control modules, read for telemetry */
   float    current_temp_c;

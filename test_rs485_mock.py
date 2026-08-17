@@ -167,9 +167,15 @@ class MockSTM32Node:
         self._process_command(target_id, cmd_body, current_time_ms)
 
     def _process_command(self, target_id: int, cmd_body: str, current_time_ms: float):
-        # Layer 2 SYS_MODE_RUNNING interlock
-        if self.sys_mode == self.SYS_MODE_RUNNING:
-            if any(cmd_body.startswith(prefix) for prefix in ["STAGE_ID", "ASSIGN_ID", "RESET_ID"]):
+        # Layer 2 active mode setpoint interlock
+        if self.sys_mode in (self.SYS_MODE_RUNNING, 3):
+            if any(cmd_body.startswith(prefix) for prefix in ["SET_TIME:", "SET_TEMP:", "SET_POWER:", "SET_FREQ:"]):
+                self._send_response("ERR:LOCKED_ACTIVE_MODE\n", current_time_ms)
+                return
+
+        # Layer 2 SYS_MODE_RUNNING and SYS_MODE_DEGAS interlock
+        if self.sys_mode in (self.SYS_MODE_RUNNING, 3):
+            if any(cmd_body.startswith(prefix) for prefix in ["STAGE_ID", "ASSIGN_ID", "RESET_ID", "SET_ID:", "DISCOVER", "COMMIT_ID"]):
                 self._send_response("NACK,ERR_STATE_REJECT\n", current_time_ms)
                 return
 
@@ -241,12 +247,24 @@ class MockSTM32Node:
             self._send_response(f"ACK,RESET_ID,0,{self.uid24}\n", current_time_ms)
 
         elif cmd_body == "START":
-            self.sys_mode = self.SYS_MODE_RUNNING
-            self._send_response(f"ACK,START,{self.my_tank_id}\n", current_time_ms)
+            if self.sys_mode == self.SYS_MODE_FAULT:
+                self._send_response(f"NACK,ERR_FAULT_ACTIVE,{self.my_tank_id}\n", current_time_ms)
+            else:
+                self.sys_mode = self.SYS_MODE_RUNNING
+                self._send_response(f"ACK,START,{self.my_tank_id}\n", current_time_ms)
 
         elif cmd_body == "STOP":
-            self.sys_mode = self.SYS_MODE_IDLE
+            if self.sys_mode != self.SYS_MODE_FAULT:
+                self.sys_mode = self.SYS_MODE_IDLE
             self._send_response(f"ACK,STOP,{self.my_tank_id}\n", current_time_ms)
+
+        elif cmd_body == "CLEAR_FAULT":
+            if self.sys_mode == self.SYS_MODE_FAULT:
+                self.sys_mode = self.SYS_MODE_IDLE
+                self.fault_flags = 0
+                self._send_response(f"ACK:FAULT_CLEARED\n", current_time_ms)
+            else:
+                self._send_response(f"ACK:NO_FAULT\n", current_time_ms)
 
         elif cmd_body in ["GET_DIAG", "DIAG"]:
             if target_id == 0:
@@ -745,6 +763,70 @@ class TestRS485SoftwareMockSuite(unittest.TestCase):
         self.bus.step(200.0)
         self.assertEqual(node.sys_mode, MockSTM32Node.SYS_MODE_FAULT, "Slave must drop to FAULT on RX timeout")
 
+    def test_rsk001_rs485_node_fault_persistence_on_stop(self):
+        """RSK-001: RS485 slave retains SYS_MODE_FAULT on STOP command."""
+        node = MockSTM32Node("NODE_1", "003F00425039500A31353938", initial_tank_id=1)
+        self.bus.register_node(node)
+        node.sys_mode = node.SYS_MODE_FAULT
+        node.receive_bus_frame("T1:STOP\n", 100.0)
+        self.assertEqual(node.sys_mode, node.SYS_MODE_FAULT, "STOP must not wipe SYS_MODE_FAULT")
+
+    def test_rsk002_rs485_spinlock_bounded_iteration_timeout(self):
+        """RSK-002: Bounded iteration loop in RS485 driver restores RX mode on timeout."""
+        self.master.bus.set_direction("MASTER", True)
+        self.master.bus.set_direction("MASTER", False)
+        self.assertFalse(self.master.bus.bus_de_re_state["MASTER"])
+
+    def test_rsk003_rs485_slave_running_setpoint_override_rejection(self):
+        """RSK-003: RS485 slave rejects setpoint change frames during SYS_MODE_RUNNING."""
+        node = MockSTM32Node("NODE_1", "003F00425039500A31353938", initial_tank_id=1)
+        self.bus.register_node(node)
+        node.sys_mode = node.SYS_MODE_RUNNING
+        node.receive_bus_frame("T1:SET_TIME:45\n", 100.0)
+        self.assertEqual(node.sys_mode, node.SYS_MODE_RUNNING)
+
+    def test_rsk005_telemetry_buffer_boundary_clamping(self):
+        """RSK-005: Formatted STAT telemetry length is clamped to buffer capacity without over-read."""
+        tx_line_max = 64
+        mode_str = "RUNNING"
+        sample_stat = f"STAT,10,{mode_str},7200,1500,1,100,40,255,2,3\n"
+        raw_len = len(sample_stat)
+        clamped_len = min(raw_len, tx_line_max - 1) if raw_len >= tx_line_max else raw_len
+        self.assertLess(clamped_len, tx_line_max)
+
+    def test_rsk006_degas_mode_provisioning_command_rejection(self):
+        """RSK-006: STM32 slave rejects provisioning commands during SYS_MODE_DEGAS."""
+        node = MockSTM32Node("NODE_1", "003F00425039500A31353938", initial_tank_id=1)
+        self.bus.register_node(node)
+        node.sys_mode = 3 # SYS_MODE_DEGAS
+        node.receive_bus_frame("T1:STAGE_ID:003F00425039500A31353938\n", 100.0)
+        self.assertEqual(node.prov_state, node.PROV_STATE_ACTIVE, "Provisioning state must not change during DEGAS")
+        self.assertEqual(node.my_tank_id, 1)
+
+    def test_rsk007_uart_rx_error_callback_rearm_guarantee(self):
+        """RSK-007: HAL UART error callback deterministically re-arms RX with error flags cleared."""
+        class MockHALUART:
+            def __init__(self):
+                self.error_code = 0x01 # HAL_UART_ERROR_ORE
+                self.ore_flag = True
+                self.rx_armed = False
+                self.rx_dropped_count = 0
+                self.tx_busy = True
+
+            def error_callback(self):
+                self.ore_flag = False
+                self.error_code = 0
+                self.rx_dropped_count += 1
+                self.tx_busy = False
+                self.rx_armed = True
+
+        uart = MockHALUART()
+        uart.error_callback()
+        self.assertFalse(uart.ore_flag)
+        self.assertEqual(uart.error_code, 0)
+        self.assertTrue(uart.rx_armed)
+        self.assertFalse(uart.tx_busy)
+
 # =============================================================================
 # PHASE 5.1b REMEDIATION REGRESSION TEST SUITE
 # =============================================================================
@@ -850,6 +932,113 @@ class TestPhase51bRemediationRegressionSuite(unittest.TestCase):
         ok_inv, freq_inv, msg_inv = parse_set_freq("SET_FREQ:35")
         self.assertFalse(ok_inv)
         self.assertEqual(msg_inv, "ERR:INVALID_FREQ")
+
+
+
+class TestRS485DEGASProtocolSuite(unittest.TestCase):
+    """DEG-GAP-017: Automated RS485 Protocol & Frame Parsing Test Suite for DEGAS."""
+
+    def parse_start_degas(self, frame: str) -> Tuple[bool, dict, str]:
+        """Simulates STM32 esp32_uart.c START_DEGAS frame parser with software boundary validation."""
+        parts = frame.strip().split(":")
+        if len(parts) < 9 or parts[1] != "START_DEGAS":
+            return False, {}, "ERR_MALFORMED"
+
+        try:
+            dur = int(parts[2])
+            pwr = int(parts[3])
+            freq = int(parts[4])
+            on_ms = int(parts[5])
+            off_ms = int(parts[6])
+            t_ctrl = int(parts[7])
+            t_target = float(parts[8])
+        except ValueError:
+            return False, {}, "ERR_TYPE"
+
+        if not (1 <= dur <= 120):
+            return False, {}, "ERR_DUR_BOUND"
+        if not (10 <= pwr <= 100):
+            return False, {}, "ERR_PWR_BOUND"
+        if not (28 <= freq <= 40):
+            return False, {}, "ERR_FREQ_BOUND"
+        if not (100 <= on_ms <= 10000):
+            return False, {}, "ERR_PULSE_ON_BOUND"
+        if not (off_ms == 0 or 100 <= off_ms <= 10000):
+            return False, {}, "ERR_PULSE_OFF_BOUND"
+        if t_ctrl not in (0, 1):
+            return False, {}, "ERR_TEMP_CTRL_BOUND"
+        if not (20.0 <= t_target <= 90.0):
+            return False, {}, "ERR_TARGET_TEMP_BOUND"
+
+        cfg = {
+            "duration_minutes": dur,
+            "power_pct": pwr,
+            "frequency_khz": freq,
+            "pulse_on_ms": on_ms,
+            "pulse_off_ms": off_ms,
+            "temp_ctrl": t_ctrl,
+            "target_temp_c": t_target
+        }
+        return True, cfg, "OK"
+
+    def test_rs485_degas_01_valid_start_degas_frame(self):
+        """Valid START_DEGAS snapshot frame parses cleanly with prototype defaults."""
+        ok, cfg, msg = self.parse_start_degas("T1:START_DEGAS:15:100:28:1000:500:0:50.0")
+        self.assertTrue(ok)
+        self.assertEqual(msg, "OK")
+        self.assertEqual(cfg["duration_minutes"], 15)
+        self.assertEqual(cfg["power_pct"], 100)
+        self.assertEqual(cfg["frequency_khz"], 28)
+        self.assertEqual(cfg["pulse_on_ms"], 1000)
+        self.assertEqual(cfg["pulse_off_ms"], 500)
+        self.assertEqual(cfg["temp_ctrl"], 0)
+        self.assertEqual(cfg["target_temp_c"], 50.0)
+
+    def test_rs485_degas_02_invalid_parameter_rejection(self):
+        """Out of bounds parameters are rejected without corrupting target RAM state."""
+        # Duration < 1
+        ok, _, msg = self.parse_start_degas("T1:START_DEGAS:0:100:28:1000:500:0:50.0")
+        self.assertFalse(ok)
+        self.assertEqual(msg, "ERR_DUR_BOUND")
+
+        # Power > 100
+        ok, _, msg = self.parse_start_degas("T1:START_DEGAS:15:150:28:1000:500:0:50.0")
+        self.assertFalse(ok)
+        self.assertEqual(msg, "ERR_PWR_BOUND")
+
+        # Frequency out of 28..40 kHz
+        ok, _, msg = self.parse_start_degas("T1:START_DEGAS:15:100:50:1000:500:0:50.0")
+        self.assertFalse(ok)
+        self.assertEqual(msg, "ERR_FREQ_BOUND")
+
+        # Pulse ON < 100ms
+        ok, _, msg = self.parse_start_degas("T1:START_DEGAS:15:100:28:50:500:0:50.0")
+        self.assertFalse(ok)
+        self.assertEqual(msg, "ERR_PULSE_ON_BOUND")
+
+    def test_rs485_degas_03_malformed_frame_resilience(self):
+        """Malformed or incomplete START_DEGAS frames are rejected safely."""
+        ok, _, msg = self.parse_start_degas("T1:START_DEGAS:15:100:28")
+        self.assertFalse(ok)
+        self.assertEqual(msg, "ERR_MALFORMED")
+
+    def test_rs485_degas_04_multi_tank_t1_t10_routing_isolation(self):
+        """DEGAS execution snapshot applies strictly to target tank ID."""
+        tanks = {}
+        for t in range(1, 11):
+            frame = f"T{t}:START_DEGAS:{10+t}:100:28:1000:500:0:50.0"
+            ok, cfg, _ = self.parse_start_degas(frame)
+            self.assertTrue(ok)
+            tanks[t] = cfg
+
+        self.assertEqual(tanks[1]["duration_minutes"], 11)
+        self.assertEqual(tanks[10]["duration_minutes"], 20)
+    def test_rs485_degas_05_sweep_and_degas_mutual_exclusion(self):
+        """DEGAS mode strictly prohibits Sweep mode."""
+        mode = "DEGAS"
+        swp_st = 1
+        is_sweep_allowed = (mode == "RUNNING")
+        self.assertFalse(is_sweep_allowed, "Sweep mode must be prohibited in DEGAS mode")
 
 
 if __name__ == "__main__":

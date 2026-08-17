@@ -113,15 +113,7 @@ void TankId_ConfirmStaging(uint8_t final_id);
 #define ZERO_CROSS_Pin GPIO_PIN_7
 #define ZERO_CROSS_GPIO_Port GPIOC
 
-/* DIP switch hardware ID pins (active-low, internal pull-up: switch ON = GND = bit set) */
-#define DIP_SW1_Pin GPIO_PIN_8
-#define DIP_SW1_GPIO_Port GPIOC
-#define DIP_SW2_Pin GPIO_PIN_9
-#define DIP_SW2_GPIO_Port GPIOC
-#define DIP_SW3_Pin GPIO_PIN_10
-#define DIP_SW3_GPIO_Port GPIOC
-#define DIP_SW4_Pin GPIO_PIN_11
-#define DIP_SW4_GPIO_Port GPIOC
+
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

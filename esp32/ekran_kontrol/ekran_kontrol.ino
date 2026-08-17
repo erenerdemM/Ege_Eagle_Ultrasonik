@@ -77,11 +77,28 @@ const unsigned long SERVICE_SESSION_TIMEOUT_MS = 300000; // 5 minute auth timeou
 int guc_seviyesi = 50;       
 int kart_id = 1;             
 int max_goz_sayisi = 3;      
+int step_increment = 4;
+int swp_span = 2;
+int swp_per = 400;
 
 // ==========================================
 // 2. HER GÖZÜN BAĞIMSIZ BEYNİ (ARRAY/DİZİLER)
 // ==========================================
+struct ESP32DegasConfig {
+  uint16_t duration_minutes = 15;
+  uint8_t  power_pct = 100;
+  uint8_t  frequency_khz = 28;
+  uint16_t pulse_on_ms = 1000;
+  uint16_t pulse_off_ms = 500;
+  uint8_t  temp_ctrl = 0;
+  float    target_temp_c = 50.0;
+} service_degas[MAX_GOZ];
+
+Preferences degasPrefs;
+
 bool makine_calisiyor[MAX_GOZ];
+bool degas_armed[MAX_GOZ];
+bool degas_active[MAX_GOZ];
 String durum_metni[MAX_GOZ];
 int hedef_sure[MAX_GOZ];      
 int hedef_sicaklik[MAX_GOZ];  
@@ -111,7 +128,7 @@ Preferences prefs;
 // Requirement 2 (Layer 1): ESP32 Master Interlock - Check if any tank is currently running
 bool isAnyTankRunning() {
   for (int i = 1; i < MAX_GOZ; i++) {
-    if (stm_bagli[i] && (makine_calisiyor[i] || stm_relay[i] != 0)) {
+    if (stm_bagli[i] && (makine_calisiyor[i] || degas_active[i] || stm_relay[i] != 0)) {
       return true;
     }
   }
@@ -185,6 +202,9 @@ void nvsYukle() {
   guc_seviyesi = prefs.getInt("guc", guc_seviyesi);
   kart_id = prefs.getInt("kartid", kart_id);
   max_goz_sayisi = prefs.getInt("maxgoz", max_goz_sayisi);
+  step_increment = prefs.getInt("step_inc", 4);
+  swp_span = prefs.getInt("swp_span", 2);
+  swp_per = prefs.getInt("swp_per", 400);
   prefs.end();
 
   // HIL_DEEP_DEBUG: dump every NVS key read back, so the host can confirm persisted values loaded correctly
@@ -195,6 +215,9 @@ void nvsYukle() {
   Serial.println("DEBUG_ESP32: NVS_READ key=guc val=" + String(guc_seviyesi));
   Serial.println("DEBUG_ESP32: NVS_READ key=kartid val=" + String(kart_id));
   Serial.println("DEBUG_ESP32: NVS_READ key=maxgoz val=" + String(max_goz_sayisi));
+  Serial.println("DEBUG_ESP32: NVS_READ key=step_inc val=" + String(step_increment));
+  Serial.println("DEBUG_ESP32: NVS_READ key=swp_span val=" + String(swp_span));
+  Serial.println("DEBUG_ESP32: NVS_READ key=swp_per val=" + String(swp_per));
 }
 
 void nvsKaydet() {
@@ -206,6 +229,9 @@ void nvsKaydet() {
   prefs.putInt("guc", guc_seviyesi);
   prefs.putInt("kartid", kart_id);
   prefs.putInt("maxgoz", max_goz_sayisi);
+  prefs.putInt("step_inc", step_increment);
+  prefs.putInt("swp_span", swp_span);
+  prefs.putInt("swp_per", swp_per);
   prefs.end();
 
   // HIL_DEEP_DEBUG: confirm what was actually written this call, for NVS round-trip verification
@@ -216,6 +242,76 @@ void nvsKaydet() {
   Serial.println("DEBUG_ESP32: NVS_WRITE key=guc val=" + String(guc_seviyesi));
   Serial.println("DEBUG_ESP32: NVS_WRITE key=kartid val=" + String(kart_id));
   Serial.println("DEBUG_ESP32: NVS_WRITE key=maxgoz val=" + String(max_goz_sayisi));
+  Serial.println("DEBUG_ESP32: NVS_WRITE key=step_inc val=" + String(step_increment));
+  Serial.println("DEBUG_ESP32: NVS_WRITE key=swp_span val=" + String(swp_span));
+  Serial.println("DEBUG_ESP32: NVS_WRITE key=swp_per val=" + String(swp_per));
+}
+
+// --- DEGAS SERVICE NVS PERSISTENCE (service_degas) ---
+void degasNvsYukle() {
+  degasPrefs.begin("degas_cfg", false);
+  for (int g = 1; g < MAX_GOZ; g++) {
+    String pfx = String("d") + String(g) + "_";
+    service_degas[g].duration_minutes = degasPrefs.getUShort((pfx + "dur").c_str(), 15);
+    service_degas[g].power_pct        = degasPrefs.getUChar((pfx + "pwr").c_str(), 100);
+    service_degas[g].frequency_khz    = degasPrefs.getUChar((pfx + "frq").c_str(), 28);
+    service_degas[g].pulse_on_ms      = degasPrefs.getUShort((pfx + "on").c_str(), 1000);
+    service_degas[g].pulse_off_ms     = degasPrefs.getUShort((pfx + "off").c_str(), 500);
+    service_degas[g].temp_ctrl        = degasPrefs.getUChar((pfx + "tc").c_str(), 0);
+    service_degas[g].target_temp_c    = degasPrefs.getFloat((pfx + "tgt").c_str(), 50.0f);
+
+    /* Software boundary validation on load */
+    if (service_degas[g].duration_minutes < 1 || service_degas[g].duration_minutes > 120) service_degas[g].duration_minutes = 15;
+    if (service_degas[g].power_pct < 10 || service_degas[g].power_pct > 100) service_degas[g].power_pct = 100;
+    if (service_degas[g].frequency_khz < 28 || service_degas[g].frequency_khz > 40) service_degas[g].frequency_khz = 28;
+    if (service_degas[g].pulse_on_ms < 100 || service_degas[g].pulse_on_ms > 10000) service_degas[g].pulse_on_ms = 1000;
+    if (service_degas[g].pulse_off_ms > 10000) service_degas[g].pulse_off_ms = 500;
+    if (service_degas[g].temp_ctrl > 1) service_degas[g].temp_ctrl = 0;
+    if (service_degas[g].target_temp_c < 20.0f || service_degas[g].target_temp_c > 90.0f) service_degas[g].target_temp_c = 50.0f;
+  }
+  degasPrefs.end();
+}
+
+void degasNvsKaydet(int g) {
+  if (g < 1 || g >= MAX_GOZ) return;
+  degasPrefs.begin("degas_cfg", false);
+  String pfx = String("d") + String(g) + "_";
+  degasPrefs.putUShort((pfx + "dur").c_str(), service_degas[g].duration_minutes);
+  degasPrefs.putUChar((pfx + "pwr").c_str(), service_degas[g].power_pct);
+  degasPrefs.putUChar((pfx + "frq").c_str(), service_degas[g].frequency_khz);
+  degasPrefs.putUShort((pfx + "on").c_str(), service_degas[g].pulse_on_ms);
+  degasPrefs.putUShort((pfx + "off").c_str(), service_degas[g].pulse_off_ms);
+  degasPrefs.putUChar((pfx + "tc").c_str(), service_degas[g].temp_ctrl);
+  degasPrefs.putFloat((pfx + "tgt").c_str(), service_degas[g].target_temp_c);
+  degasPrefs.end();
+}
+
+void updateDegasPageUI(int g) {
+  if (g < 1 || g >= MAX_GOZ) return;
+  nextionGonder("t_deg_goz.txt=\"Goz: " + String(g) + "\"");
+  nextionGonder("t_deg_dur.txt=\"" + String(service_degas[g].duration_minutes) + "\"");
+  nextionGonder("t_deg_pwr.txt=\"" + String(service_degas[g].power_pct) + "\"");
+  nextionGonder("t_deg_frq.txt=\"" + String(service_degas[g].frequency_khz) + "\"");
+  nextionGonder("t_deg_on.txt=\"" + String(service_degas[g].pulse_on_ms) + "\"");
+  nextionGonder("t_deg_off.txt=\"" + String(service_degas[g].pulse_off_ms) + "\"");
+  nextionGonder("t_deg_tc.txt=\"" + String(service_degas[g].temp_ctrl != 0 ? "ON" : "OFF") + "\"");
+  if (service_degas[g].temp_ctrl != 0) {
+    nextionGonder("t_deg_tgt.txt=\"" + String((int)service_degas[g].target_temp_c) + "\"");
+  } else {
+    nextionGonder("t_deg_tgt.txt=\"--\"");
+  }
+}
+
+void disarmDegasIfArmed(int g) {
+  if (g >= 1 && g < MAX_GOZ) {
+    if (degas_armed[g] && !degas_active[g]) {
+      degas_armed[g] = false;
+      if (g == secili_goz) {
+        nextionGonder("b_degas.bco=" + String(NEXTION_COLOR_DEFAULT));
+      }
+      Serial.println("--> ESP32: DEGAS selection intent disarmed on normal parameter edit.");
+    }
+  }
 }
 
 // ==========================================
@@ -421,6 +517,26 @@ void stmSetFreq(int freq) {
   stmGonder("SET_FREQ:" + String(freq) + "\n");
 }
 
+void stmSweep(bool enabled) {
+  if (enabled) {
+    stmGonder("SWEEP:ON\n");
+  } else {
+    stmGonder("SWEEP:OFF\n");
+  }
+}
+
+void stmSetStepInc(int inc) {
+  stmGonder("SET_STEP_INC:" + String(inc) + "\n");
+}
+
+void stmSetSwpSpan(int span) {
+  stmGonder("SET_SWP_SPAN:" + String(span) + "\n");
+}
+
+void stmSetSwpPer(int per) {
+  stmGonder("SET_SWP_PER:" + String(per) + "\n");
+}
+
 void stmStart() {
   stmGonder("START\n");
 }
@@ -443,6 +559,9 @@ void stmSetpointleriGonder() {
   stmSetTime(hedef_sure[secili_goz]);
   stmSetTemp(hedef_sicaklik[secili_goz]);
   stmSetPower(guc_seviyesi);
+  stmSetStepInc(step_increment);
+  stmSetSwpSpan(swp_span);
+  stmSetSwpPer(swp_per);
 }
 
 // HIL_TEST_MOD: "T<digit(s)>:" adres onekiyle baslayan hatlari STM32 bus komutu olarak tanir
@@ -455,11 +574,39 @@ bool isBusKomut(const String &s) {
 }
 
 // ==========================================
-// STM32 -> ESP32: "STAT,<TankID>,<Mode>,<rem_sec>,<temp_x10>,<relay>,<pwr>,<freq>,<fault>,<prov>"
+// STM32 -> ESP32: "STAT,<TankID>,<Mode>,<rem_sec>,<temp_x10>,<relay>,<pwr>,<freq>,<fault>,<prov>,<sweep>"
 // Gelen veri HER ZAMAN kendi Tank ID'sinin dizisine yazilir (10 tank da arka planda
 // izlenir); Nextion ekran guncellemesi ise SADECE TankID, o an secili_goz (mevcut_goz)
 // ile eslesirse yapilir.
 void stmTelemetryIsle(String satir) {
+  if (satir.startsWith("ERR:") || satir.startsWith("NACK")) {
+    Serial.println("--> STM32 REJECTION: " + satir);
+    if (satir.startsWith("ERR:LOCKED_ACTIVE_MODE") || satir.startsWith("ERR:LOCKED_SYS_RUNNING")) {
+      durum_metni[secili_goz] = "HATA: CALISIYOR!";
+    } else if (satir.startsWith("ERR:SWEEP_PROHIBITED_IN_DEGAS")) {
+      durum_metni[secili_goz] = "HATA: DEGAS AKTIF!";
+    } else if (satir.startsWith("ERR:INVALID_SYS_MODE")) {
+      durum_metni[secili_goz] = "HATA: GECERSIZ MOD!";
+    } else if (satir.startsWith("NACK,ERR_FAULT_ACTIVE")) {
+      durum_metni[secili_goz] = "HATA: ARIZA AKTIF!";
+    } else {
+      durum_metni[secili_goz] = "HATA: " + satir.substring(0, 16);
+    }
+    nextionGonder("t_durum.txt=\"" + durum_metni[secili_goz] + "\"");
+    return;
+  }
+
+  if (satir.startsWith("ACK:") || satir.startsWith("ACK,") || satir.startsWith("DISCOVER_ACK,")) {
+    Serial.println("--> STM32 ACK: " + satir);
+    if (satir.startsWith("ACK:FAULT_CLEARED") || satir.startsWith("ACK:NO_FAULT")) {
+      if (durum_metni[secili_goz].startsWith("HATA")) {
+        durum_metni[secili_goz] = "SISTEM BEKLEMEDE";
+        nextionGonder("t_durum.txt=\"" + durum_metni[secili_goz] + "\"");
+      }
+    }
+    return;
+  }
+
   if (!satir.startsWith("STAT,")) return;
 
   String rest = satir.substring(5);
@@ -471,6 +618,7 @@ void stmTelemetryIsle(String satir) {
   int p6 = rest.indexOf(',', p5 + 1);
   int p7 = rest.indexOf(',', p6 + 1);
   int p8 = rest.indexOf(',', p7 + 1);
+  int p9 = rest.indexOf(',', p8 + 1);
   if (p1 == -1 || p2 == -1 || p3 == -1 || p4 == -1 || p5 == -1 || p6 == -1 || p7 == -1 || p8 == -1) return; // hatalı çerçeve
 
   int tank_id = rest.substring(0, p1).toInt();
@@ -481,7 +629,8 @@ void stmTelemetryIsle(String satir) {
   int pwr = rest.substring(p5 + 1, p6).toInt();
   int freq = rest.substring(p6 + 1, p7).toInt();
   int fault = rest.substring(p7 + 1, p8).toInt();
-  int prov_st = rest.substring(p8 + 1).toInt();
+  int prov_st = (p9 != -1) ? rest.substring(p8 + 1, p9).toInt() : rest.substring(p8 + 1).toInt();
+  int swp_st  = (p9 != -1) ? rest.substring(p9 + 1).toInt() : 0;
 
   if (tank_id < 1 || tank_id >= MAX_GOZ) return; // bozuk/gecersiz Tank ID -> dizi sinirlari disi erisim engellenir
 
@@ -494,6 +643,15 @@ void stmTelemetryIsle(String satir) {
   stm_fault[g] = fault;
   stm_prov_state[g] = prov_st;
   makine_calisiyor[g] = (mode_str == "RUNNING");
+  bool was_degas = degas_active[g];
+  degas_active[g] = (mode_str == "DEGAS");
+
+  if (!degas_active[g] && was_degas) {
+    degas_armed[g] = false;
+    if (g == secili_goz) {
+      nextionGonder("b_degas.bco=" + String(NEXTION_COLOR_DEFAULT));
+    }
+  }
 
   bool yeniden_baglandi = !stm_bagli[g];
   stm_bagli[g] = true;
@@ -501,9 +659,16 @@ void stmTelemetryIsle(String satir) {
 
   if (fault > 0) {
     durum_metni[g] = "HATA! KOD:" + String(fault);
+    degas_active[g] = false;
+    degas_armed[g] = false;
+    if (g == secili_goz) {
+      nextionGonder("b_degas.bco=" + String(NEXTION_COLOR_DEFAULT));
+    }
   } else if (mode_str == "RUNNING") {
     durum_metni[g] = "YIKAMA DEVAM EDIYOR...";
-  } else if (rem_sec <= 0 && hedef_sure[g] > 0) {
+  } else if (mode_str == "DEGAS") {
+    durum_metni[g] = "DEGAS DEVAM EDIYOR...";
+  } else if (rem_sec <= 0 && (hedef_sure[g] > 0 || was_degas)) {
     durum_metni[g] = "YIKAMA TAMAMLANDI!";
   } else {
     durum_metni[g] = "SISTEM BEKLEMEDE";
@@ -512,8 +677,9 @@ void stmTelemetryIsle(String satir) {
   // --- HMI Durum Senkronizasyonu: sadece ekranda gosterilen goz icin aninda gonder ---
   if (g == secili_goz) {
     const char *hmi_durum = (mode_str == "RUNNING") ? "Calisiyor"
+                          : (mode_str == "DEGAS")   ? "Degas"
                           : (mode_str == "FAULT")   ? "Hata"
-                                                     : "Beklemede";
+                                                    : "Beklemede";
     nextionGonder("t_status.txt=\"" + String(hmi_durum) + "\"");
 
     if (yeniden_baglandi) stmSetpointleriGonder(); // reconnect senkronizasyonu
@@ -536,6 +702,8 @@ void setup() {
 
   for(int i=0; i<MAX_GOZ; i++) {
     makine_calisiyor[i] = false;
+    degas_armed[i] = false;
+    degas_active[i] = false;
     durum_metni[i] = "SISTEM BEKLEMEDE";
     hedef_sure[i] = 0;
     kalan_saniye[i] = 0;
@@ -551,6 +719,7 @@ void setup() {
   }
   
   nvsYukle();
+  degasNvsYukle();
   walKurtar();
 
   Serial.println("[SYS] Boot... NVS setpoints yuklendi:");
@@ -590,9 +759,53 @@ void komutIsle(String komut) {
   // HIL_DEEP_DEBUG: raw payload entering the HMI command decoder, regardless of source (Nextion/USB)
   Serial.println("DEBUG_ESP32: HMI_RX raw=\"" + komut + "\"");
 
+  // --- DEGAS MODU SEÇİMİ (Page 0) ---
+  else if (komut == "CMD_DEGAS_SEL" || komut == "CMD_DEGAS_SELECT" || komut == "DEGAS_SEL") {
+    if (makine_calisiyor[secili_goz] || degas_active[secili_goz]) {
+      Serial.println("--> DEGAS SECIMI REDDEDILDI: Yıkama/DEGAS aktif!");
+      return;
+    }
+    degas_armed[secili_goz] = !degas_armed[secili_goz];
+    if (degas_armed[secili_goz]) {
+      stmSweep(false); // DEGAS ve Sweep kesinlikle birbirini dislar
+      nextionGonder("b_degas.bco=" + String(NEXTION_COLOR_GREEN));
+      durum_metni[secili_goz] = "DEGAS SECILDI. START BEKLENIYOR";
+      Serial.println("--> ESP32: GÖZ " + String(secili_goz) + " DEGAS ARMED!");
+    } else {
+      nextionGonder("b_degas.bco=" + String(NEXTION_COLOR_DEFAULT));
+      durum_metni[secili_goz] = "SISTEM BEKLEMEDE";
+      Serial.println("--> ESP32: GÖZ " + String(secili_goz) + " DEGAS DISARMED.");
+    }
+  }
+  else if (komut == "CMD_DEGAS_DESELECT" || komut == "DEGAS_DESEL") {
+    degas_armed[secili_goz] = false;
+    nextionGonder("b_degas.bco=" + String(NEXTION_COLOR_DEFAULT));
+    durum_metni[secili_goz] = "SISTEM BEKLEMEDE";
+    Serial.println("--> ESP32: GÖZ " + String(secili_goz) + " DEGAS DESELECTED.");
+  }
+
   // --- HIZLI PROGRAM (FP) (Page 0) ---
-  if (komut == "P_HIZLI") {
+  else if (komut == "P_HIZLI") {
+    if (makine_calisiyor[secili_goz] || degas_active[secili_goz]) {
+      Serial.println("--> P_HIZLI REDDEDILDI: ISLEM AKTIF!");
+      return;
+    }
     if (baslatmaEngelliMi()) return;
+
+    if (degas_armed[secili_goz]) {
+      durum_metni[secili_goz] = "DEGAS DEVAM EDIYOR...";
+      int g = secili_goz;
+      String snapCmd = "START_DEGAS:" + String(service_degas[g].duration_minutes) +
+                       ":" + String(service_degas[g].power_pct) +
+                       ":" + String(service_degas[g].frequency_khz) +
+                       ":" + String(service_degas[g].pulse_on_ms) +
+                       ":" + String(service_degas[g].pulse_off_ms) +
+                       ":" + String(service_degas[g].temp_ctrl) +
+                       ":" + String(service_degas[g].target_temp_c, 1);
+      Serial.println("--> ESP32: GÖZ " + String(g) + " DEGAS START Frame: " + snapCmd);
+      stmGonder(snapCmd + "\n");
+      return;
+    }
 
     hedef_sure[secili_goz] = 5;    
     hedef_sicaklik[secili_goz] = 30; 
@@ -611,8 +824,27 @@ void komutIsle(String komut) {
   }
   
   // --- MOTORU BAŞLAT (Page 0) ---
-  else if (komut.startsWith("CMD_START|")) {
+  else if (komut.startsWith("CMD_START|") || komut == "CMD_START") {
+    if (degas_active[secili_goz]) {
+      Serial.println("--> START REDDEDILDI: DEGAS AKTIF!");
+      return;
+    }
     if (baslatmaEngelliMi()) return;
+
+    if (degas_armed[secili_goz]) {
+      durum_metni[secili_goz] = "DEGAS DEVAM EDIYOR...";
+      int g = secili_goz;
+      String snapCmd = "START_DEGAS:" + String(service_degas[g].duration_minutes) +
+                       ":" + String(service_degas[g].power_pct) +
+                       ":" + String(service_degas[g].frequency_khz) +
+                       ":" + String(service_degas[g].pulse_on_ms) +
+                       ":" + String(service_degas[g].pulse_off_ms) +
+                       ":" + String(service_degas[g].temp_ctrl) +
+                       ":" + String(service_degas[g].target_temp_c, 1);
+      Serial.println("--> DEGAS START! GÖZ: " + String(g) + " Frame: " + snapCmd);
+      stmGonder(snapCmd + "\n");
+      return;
+    }
 
     int fPipe = komut.indexOf('|');
     int sPipe = komut.indexOf('|', fPipe + 1);
@@ -641,19 +873,53 @@ void komutIsle(String komut) {
           stmSetPower(guc_seviyesi);
           stmStart();
         }
+    } else {
+      /* Pipe'siz CMD_START */
+      makine_calisiyor[secili_goz] = true;
+      durum_metni[secili_goz] = "YIKAMA DEVAM EDIYOR...";
+      stmStart();
     }
   }
   
   // --- DURDUR (Page 0) ---
   else if (komut == "CMD_STOP") {
     makine_calisiyor[secili_goz] = false;
+    degas_active[secili_goz] = false;
+    degas_armed[secili_goz] = false;
+    nextionGonder("b_degas.bco=" + String(NEXTION_COLOR_DEFAULT));
     durum_metni[secili_goz] = "SISTEM DURDURULDU";
     Serial.println("--> MOTOR STOP! GÖZ: " + String(secili_goz) + " Durduruldu.");
     stmStop(); // fault-ack olarak da çalışır
   }
 
+  // --- FREKANS SWEEP ---
+  else if (komut == "CMD_SWEEP_ON" || komut == "CMD_SWEEP|ON") {
+    if (degas_active[secili_goz]) {
+      Serial.println("--> SWEEP LOCKED: DEGAS IS ACTIVE!");
+      return;
+    }
+    if (degas_armed[secili_goz]) {
+      degas_armed[secili_goz] = false;
+      nextionGonder("b_degas.bco=" + String(NEXTION_COLOR_DEFAULT));
+    }
+    stmSweep(true);
+    Serial.println("--> SWEEP ON! GOZ: " + String(secili_goz) + " | ±2 kHz | 400 ms");
+  }
+  else if (komut == "CMD_SWEEP_OFF" || komut == "CMD_SWEEP|OFF") {
+    stmSweep(false);
+    Serial.println("--> SWEEP OFF! GOZ: " + String(secili_goz));
+  }
+
   // --- FREKANS SEÇİMİ (28 kHz / 40 kHz) ---
   else if (komut.startsWith("CMD_FREQ|") || komut.startsWith("SET_FREQ|")) {
+    if (makine_calisiyor[secili_goz] || degas_active[secili_goz]) {
+      Serial.println("--> FREQ SELECTION LOCKED: PROCESS IS ACTIVE!");
+      return;
+    }
+    if (degas_armed[secili_goz]) {
+      degas_armed[secili_goz] = false;
+      nextionGonder("b_degas.bco=" + String(NEXTION_COLOR_DEFAULT));
+    }
     int pipe = komut.indexOf('|');
     if (pipe != -1) {
       int freq = komut.substring(pipe + 1).toInt();
@@ -664,7 +930,16 @@ void komutIsle(String komut) {
 
   // --- PROGRAM SEÇİMLERİ (Page 0) - Sayfa değişimi YOK, Sadece veri yükler ---
   else if (komut == "P1_SEL" || komut == "P2_SEL" || komut == "P3_SEL") {
+    if (makine_calisiyor[secili_goz] || degas_active[secili_goz]) {
+      Serial.println("--> RECIPE SELECTION LOCKED: PROCESS IS ACTIVE!");
+      return;
+    }
     if (baslatmaEngelliMi()) return;
+
+    if (degas_armed[secili_goz]) {
+      degas_armed[secili_goz] = false;
+      nextionGonder("b_degas.bco=" + String(NEXTION_COLOR_DEFAULT));
+    }
 
     aktif_program = (komut == "P1_SEL") ? 1 : ((komut == "P2_SEL") ? 2 : 3);
 
@@ -686,6 +961,10 @@ void komutIsle(String komut) {
 
   // --- PROGRAM DÜZENLEME SEÇİMİ (Page 2) ---
   else if (komut == "EDIT_P1" || komut == "EDIT_P2" || komut == "EDIT_P3") {
+    if (makine_calisiyor[secili_goz] || degas_active[secili_goz]) {
+      Serial.println("--> RECIPE EDITING LOCKED: PROCESS IS ACTIVE!");
+      return;
+    }
     duzenlenen_program = (komut == "EDIT_P1") ? 1 : ((komut == "EDIT_P2") ? 2 : 3);
     
     // Page 2'deki yazıları Global P Hafızasındaki değerlerle doldur
@@ -698,6 +977,14 @@ void komutIsle(String komut) {
 
   // --- PROGRAM KAYDETME (Page 2) ---
   else if (komut.startsWith("P_SAVE|")) {
+    if (!isProvisioningAllowed()) {
+      Serial.println("--> AUTH REJECTED: SERVICE PIN REQUIRED FOR RECIPE SAVE");
+      return;
+    }
+    if (degas_active[secili_goz] || makine_calisiyor[secili_goz]) {
+      Serial.println("--> RECIPE SAVE LOCKED: PROCESS IS ACTIVE!");
+      return;
+    }
     int fPipe = komut.indexOf('|');
     int sPipe = komut.indexOf('|', fPipe + 1);
     
@@ -723,10 +1010,13 @@ void komutIsle(String komut) {
 
   // --- KART/GÖZ SEÇİMİ (Page 1) ---
   else if (komut == "PAGE1_OPEN") {
+    if (!isProvisioningAllowed()) {
+      nextionGonder("b_save.bco=" + String(NEXTION_COLOR_RED));
+      return;
+    }
+    nextionGonder("page page1");
     temp_goz = secili_goz;
-    delay(50);
     nextionGonder("t0.txt=\"" + String(temp_goz) + "\"");
-    Serial.println("--> ESP32: Page 1 açıldı. Mevcut Göz (" + String(temp_goz) + ") ekrana basıldı.");
   }
   else if (komut == "UP") {
     if (temp_goz < max_goz_sayisi) temp_goz++;
@@ -739,27 +1029,23 @@ void komutIsle(String komut) {
   else if (komut == "SEL") {
     secili_goz = temp_goz;
     nextionGonder("page page0");
-    delay(50);
-
-    // Page 0'ı YENİ SEÇİLEN GÖZÜN HAFIZASIYLA doldur
     nextionGonder("b_goz.txt=\"Goz: " + String(secili_goz) + "\"");
     nextionGonder(String("t_set_sure.txt=\"") + (hedef_sure[secili_goz] < 10 ? "0" : "") + String(hedef_sure[secili_goz]) + "\"");
     nextionGonder("t_set_sic.txt=\"" + String(hedef_sicaklik[secili_goz]) + "\"");
-
-    stmSetpointleriGonder(); // yeni seçilen gözün setpointlerini STM32'ye ilet
+    stmSetpointleriGonder();
   }
   else if (komut == "BACK") {
     temp_goz = secili_goz;
     nextionGonder("page page0");
   }
 
-  // --- ŞİFRE VE DİĞER MENÜLER (Buralar aynı) ---
-  else if ((komut.startsWith("KEY") && komut.length() == 4) || (komut.startsWith("KEY_") && komut.length() == 5)) {
-    char basilanTus = komut.charAt(komut.length() - 1);
-    if (isDigit(basilanTus) && girilen_sifre.length() < 6) {
-      girilen_sifre += basilanTus;
+  // --- ŞİFRE VE KLAVYE (Page 4) ---
+  else if (komut.startsWith("KEY") && komut.length() == 4 && isDigit(komut.charAt(3))) {
+    char digit = komut.charAt(3);
+    if (girilen_sifre.length() < 6) {
+      girilen_sifre += digit;
       String yildizlar = "";
-      for(int i=0; i<girilen_sifre.length(); i++) yildizlar += "*";
+      for (int i = 0; i < girilen_sifre.length(); i++) yildizlar += "*";
       nextionGonder("t_pass.txt=\"" + yildizlar + "\"");
     }
   }
@@ -767,32 +1053,90 @@ void komutIsle(String komut) {
     if (girilen_sifre.length() > 0) {
       girilen_sifre.remove(girilen_sifre.length() - 1);
       String yildizlar = "";
-      for(int i=0; i<girilen_sifre.length(); i++) yildizlar += "*";
+      for (int i = 0; i < girilen_sifre.length(); i++) yildizlar += "*";
       nextionGonder("t_pass.txt=\"" + yildizlar + "\"");
     }
   }
   else if (komut == "KEY_OK") {
     if (girilen_sifre == dogru_sifre) {
       girilen_sifre = "";
-      g_service_authenticated = true;
+      g_service_authenticated = true; // Servis oturumu basarili
       service_auth_time = millis();
       nextionGonder("page page5");
-      delay(50);
       nextionGonder("t_guc.txt=\"" + String(guc_seviyesi) + "\"");
       nextionGonder("t_id.txt=\"" + String(kart_id) + "\"");
       nextionGonder("t_max.txt=\"" + String(max_goz_sayisi) + "\"");
-      Serial.println("--> SERVIS GIRISI BASARILI: g_service_authenticated = true");
     } else {
       girilen_sifre = "";
       g_service_authenticated = false;
       nextionGonder("t_pass.txt=\"HATALI!\"");
     }
   }
+
+  // --- SETPOINT AYARLARI (Page 0) ---
+  else if (komut == "TIME_UP" || komut == "TIME_DOWN" || komut.startsWith("SET_TIME:") || komut.startsWith("CMD_SET_TIME:")) {
+    if (makine_calisiyor[secili_goz] || degas_active[secili_goz]) return;
+    disarmDegasIfArmed(secili_goz);
+    int pipe = komut.indexOf(':');
+    if (pipe != -1) {
+      int val = komut.substring(pipe + 1).toInt();
+      if (val >= 1 && val <= 120) {
+        hedef_sure[secili_goz] = val;
+        stmSetTime(val);
+      }
+    } else if (komut == "TIME_UP") {
+      if (hedef_sure[secili_goz] < 120) {
+        hedef_sure[secili_goz]++;
+        stmSetTime(hedef_sure[secili_goz]);
+      }
+    } else if (komut == "TIME_DOWN") {
+      if (hedef_sure[secili_goz] > 1) {
+        hedef_sure[secili_goz]--;
+        stmSetTime(hedef_sure[secili_goz]);
+      }
+    }
+    nextionGonder(String("t_set_sure.txt=\"") + (hedef_sure[secili_goz] < 10 ? "0" : "") + String(hedef_sure[secili_goz]) + "\"");
+  }
+  else if (komut == "TEMP_UP" || komut == "TEMP_DOWN" || komut.startsWith("SET_TEMP:") || komut.startsWith("CMD_SET_TEMP:")) {
+    if (makine_calisiyor[secili_goz] || degas_active[secili_goz]) return;
+    disarmDegasIfArmed(secili_goz);
+    int pipe = komut.indexOf(':');
+    if (pipe != -1) {
+      int val = komut.substring(pipe + 1).toInt();
+      if (val >= 20 && val <= 90) {
+        hedef_sicaklik[secili_goz] = val;
+        stmSetTemp(val);
+      }
+    } else if (komut == "TEMP_UP") {
+      if (hedef_sicaklik[secili_goz] < 90) {
+        hedef_sicaklik[secili_goz]++;
+        stmSetTemp(hedef_sicaklik[secili_goz]);
+      }
+    } else if (komut == "TEMP_DOWN") {
+      if (hedef_sicaklik[secili_goz] > 20) {
+        hedef_sicaklik[secili_goz]--;
+        stmSetTemp(hedef_sicaklik[secili_goz]);
+      }
+    }
+    nextionGonder("t_set_sic.txt=\"" + String(hedef_sicaklik[secili_goz]) + "\"");
+  }
+
+  // --- SERVIS AYARLARI (Page 5) ---
   else if (komut == "GUC_UP") {
+    if (makine_calisiyor[secili_goz] || degas_active[secili_goz]) return;
+    if (degas_armed[secili_goz]) {
+      degas_armed[secili_goz] = false;
+      nextionGonder("b_degas.bco=" + String(NEXTION_COLOR_DEFAULT));
+    }
     if (guc_seviyesi < 100) guc_seviyesi += 10;
     nextionGonder("t_guc.txt=\"" + String(guc_seviyesi) + "\"");
   }
   else if (komut == "GUC_DOWN") {
+    if (makine_calisiyor[secili_goz] || degas_active[secili_goz]) return;
+    if (degas_armed[secili_goz]) {
+      degas_armed[secili_goz] = false;
+      nextionGonder("b_degas.bco=" + String(NEXTION_COLOR_DEFAULT));
+    }
     if (guc_seviyesi > 10) guc_seviyesi -= 10;
     nextionGonder("t_guc.txt=\"" + String(guc_seviyesi) + "\"");
   }
@@ -808,9 +1152,191 @@ void komutIsle(String komut) {
     if (max_goz_sayisi < MAX_GOZ - 1) max_goz_sayisi++; // dizi sinirini (1..10) asmayi engeller
     nextionGonder("t_max.txt=\"" + String(max_goz_sayisi) + "\"");
   }
-  else if (komut == "MAX_DOWN") {
-    if (max_goz_sayisi > 1) max_goz_sayisi--;
-    nextionGonder("t_max.txt=\"" + String(max_goz_sayisi) + "\"");
+  else if (komut.startsWith("CMD_SET_STEP_INC:") || komut.startsWith("SET_STEP_INC:")) {
+    if (!isProvisioningAllowed()) {
+      Serial.println("--> AUTH REJECTED: SERVICE PIN REQUIRED FOR SWEEP STEP INC");
+      return;
+    }
+    int val = komut.substring(komut.indexOf(':') + 1).toInt();
+    if (val >= 1 && val <= 8) {
+      step_increment = val;
+      nvsKaydet();
+      stmSetStepInc(step_increment);
+    }
+  }
+  else if (komut.startsWith("CMD_SET_SWP_SPAN:") || komut.startsWith("SET_SWP_SPAN:") || komut.startsWith("SET_SPAN:")) {
+    if (!isProvisioningAllowed()) {
+      Serial.println("--> AUTH REJECTED: SERVICE PIN REQUIRED FOR SWEEP SPAN");
+      return;
+    }
+    int val = komut.substring(komut.indexOf(':') + 1).toInt();
+    if (val >= 1 && val <= 4) {
+      swp_span = val;
+      nvsKaydet();
+      stmSetSwpSpan(swp_span);
+    }
+  }
+  else if (komut.startsWith("CMD_SET_SWP_PER:") || komut.startsWith("SET_SWP_PER:") || komut.startsWith("SET_PER:")) {
+    if (!isProvisioningAllowed()) {
+      Serial.println("--> AUTH REJECTED: SERVICE PIN REQUIRED FOR SWEEP PERIOD");
+      return;
+    }
+    int val = komut.substring(komut.indexOf(':') + 1).toInt();
+    if (val >= 100 && val <= 1000) {
+      swp_per = val;
+      nvsKaydet();
+      stmSetSwpPer(swp_per);
+    }
+  }
+  // --- SERVICE SETTINGS PAGE 3: DEGAS SETTINGS ---
+  else if (komut == "PAGE3_OPEN" || komut == "PAGE_DEGAS_OPEN" || komut == "PAGE3" || komut == "PAGE_DEGAS") {
+    if (!isProvisioningAllowed()) {
+      nextionGonder("b_save.bco=" + String(NEXTION_COLOR_RED));
+      return;
+    }
+    nextionGonder("page page3");
+    updateDegasPageUI(secili_goz);
+  }
+  else if (komut == "DEG_DUR_UP" || komut.startsWith("SET_DEG_DUR:")) {
+    if (!isProvisioningAllowed()) return;
+    int g = secili_goz;
+    if (komut.startsWith("SET_DEG_DUR:")) {
+      int v = komut.substring(12).toInt();
+      if (v >= 1 && v <= 120) service_degas[g].duration_minutes = v;
+    } else {
+      if (service_degas[g].duration_minutes < 120) service_degas[g].duration_minutes++;
+    }
+    updateDegasPageUI(g);
+  }
+  else if (komut == "DEG_DUR_DOWN") {
+    if (!isProvisioningAllowed()) return;
+    int g = secili_goz;
+    if (service_degas[g].duration_minutes > 1) service_degas[g].duration_minutes--;
+    updateDegasPageUI(g);
+  }
+  else if (komut == "DEG_PWR_UP" || komut.startsWith("SET_DEG_PWR:")) {
+    if (!isProvisioningAllowed()) return;
+    int g = secili_goz;
+    if (komut.startsWith("SET_DEG_PWR:")) {
+      int v = komut.substring(12).toInt();
+      if (v >= 10 && v <= 100) service_degas[g].power_pct = v;
+    } else {
+      if (service_degas[g].power_pct <= 90) service_degas[g].power_pct += 10;
+    }
+    updateDegasPageUI(g);
+  }
+  else if (komut == "DEG_PWR_DOWN") {
+    if (!isProvisioningAllowed()) return;
+    int g = secili_goz;
+    if (service_degas[g].power_pct >= 20) service_degas[g].power_pct -= 10;
+    updateDegasPageUI(g);
+  }
+  else if (komut == "DEG_FRQ_UP" || komut.startsWith("SET_DEG_FRQ:")) {
+    if (!isProvisioningAllowed()) return;
+    int g = secili_goz;
+    if (komut.startsWith("SET_DEG_FRQ:")) {
+      int v = komut.substring(12).toInt();
+      if (v >= 28 && v <= 40) service_degas[g].frequency_khz = v;
+    } else {
+      if (service_degas[g].frequency_khz < 40) service_degas[g].frequency_khz++;
+    }
+    updateDegasPageUI(g);
+  }
+  else if (komut == "DEG_FRQ_DOWN") {
+    if (!isProvisioningAllowed()) return;
+    int g = secili_goz;
+    if (service_degas[g].frequency_khz > 28) service_degas[g].frequency_khz--;
+    updateDegasPageUI(g);
+  }
+  else if (komut == "DEG_ON_UP" || komut.startsWith("SET_DEG_ON:")) {
+    if (!isProvisioningAllowed()) return;
+    int g = secili_goz;
+    if (komut.startsWith("SET_DEG_ON:")) {
+      int v = komut.substring(11).toInt();
+      if (v >= 100 && v <= 10000) service_degas[g].pulse_on_ms = v;
+    } else {
+      if (service_degas[g].pulse_on_ms <= 9900) service_degas[g].pulse_on_ms += 100;
+    }
+    updateDegasPageUI(g);
+  }
+  else if (komut == "DEG_ON_DOWN") {
+    if (!isProvisioningAllowed()) return;
+    int g = secili_goz;
+    if (service_degas[g].pulse_on_ms >= 200) service_degas[g].pulse_on_ms -= 100;
+    updateDegasPageUI(g);
+  }
+  else if (komut == "DEG_OFF_UP" || komut.startsWith("SET_DEG_OFF:")) {
+    if (!isProvisioningAllowed()) return;
+    int g = secili_goz;
+    if (komut.startsWith("SET_DEG_OFF:")) {
+      int v = komut.substring(12).toInt();
+      if (v == 0 || (v >= 100 && v <= 10000)) service_degas[g].pulse_off_ms = v;
+    } else {
+      if (service_degas[g].pulse_off_ms <= 9900) service_degas[g].pulse_off_ms += 100;
+    }
+    updateDegasPageUI(g);
+  }
+  else if (komut == "DEG_OFF_DOWN") {
+    if (!isProvisioningAllowed()) return;
+    int g = secili_goz;
+    if (service_degas[g].pulse_off_ms >= 100) service_degas[g].pulse_off_ms -= 100;
+    updateDegasPageUI(g);
+  }
+  else if (komut == "DEG_TC_TOGGLE" || komut.startsWith("SET_DEG_TC:")) {
+    if (!isProvisioningAllowed()) return;
+    int g = secili_goz;
+    if (komut.startsWith("SET_DEG_TC:")) {
+      int v = komut.substring(11).toInt();
+      service_degas[g].temp_ctrl = (v != 0) ? 1 : 0;
+    } else {
+      service_degas[g].temp_ctrl = (service_degas[g].temp_ctrl != 0) ? 0 : 1;
+    }
+    updateDegasPageUI(g);
+  }
+  else if (komut == "DEG_TGT_UP" || komut.startsWith("SET_DEG_TGT:")) {
+    if (!isProvisioningAllowed()) return;
+    int g = secili_goz;
+    if (service_degas[g].temp_ctrl == 0) return; // Neutralized when temp control is OFF
+    if (komut.startsWith("SET_DEG_TGT:")) {
+      float v = komut.substring(12).toFloat();
+      if (v >= 20.0f && v <= 90.0f) service_degas[g].target_temp_c = v;
+    } else {
+      if (service_degas[g].target_temp_c < 90.0f) service_degas[g].target_temp_c += 1.0f;
+    }
+    updateDegasPageUI(g);
+  }
+  else if (komut == "DEG_TGT_DOWN") {
+    if (!isProvisioningAllowed()) return;
+    int g = secili_goz;
+    if (service_degas[g].temp_ctrl == 0) return; // Neutralized when temp control is OFF
+    if (service_degas[g].target_temp_c > 20.0f) service_degas[g].target_temp_c -= 1.0f;
+    updateDegasPageUI(g);
+  }
+  else if (komut == "SRV_DEGAS_SAVE" || komut == "SRV_SAVE_DEGAS") {
+    if (!isProvisioningAllowed()) {
+      nextionGonder("b_save.bco=" + String(NEXTION_COLOR_RED));
+      g_bus_diag.tx_nack_count++;
+      return;
+    }
+    int g = secili_goz;
+    bool valid = (service_degas[g].duration_minutes >= 1 && service_degas[g].duration_minutes <= 120) &&
+                 (service_degas[g].power_pct >= 10 && service_degas[g].power_pct <= 100) &&
+                 (service_degas[g].frequency_khz >= 28 && service_degas[g].frequency_khz <= 40) &&
+                 (service_degas[g].pulse_on_ms >= 100 && service_degas[g].pulse_on_ms <= 10000) &&
+                 (service_degas[g].pulse_off_ms == 0 || (service_degas[g].pulse_off_ms >= 100 && service_degas[g].pulse_off_ms <= 10000)) &&
+                 (service_degas[g].temp_ctrl <= 1) &&
+                 (service_degas[g].target_temp_c >= 20.0f && service_degas[g].target_temp_c <= 90.0f);
+    if (!valid) {
+      nextionGonder("b_save.bco=" + String(NEXTION_COLOR_RED));
+      g_bus_diag.tx_nack_count++;
+      return;
+    }
+    degasNvsKaydet(g);
+    Serial.println("--> DEGAS SERVİS AYARLARI KAYDEDİLDİ (GÖZ " + String(g) + ")");
+    nextionGonder("b_save.bco=" + String(NEXTION_COLOR_GREEN));
+    delay(600);
+    nextionGonder("b_save.bco=" + String(NEXTION_COLOR_DEFAULT));
+    g_bus_diag.tx_ack_count++;
   }
   else if (komut == "SRV_SAVE") {
     /* Requirement 1 & 2: Gating provisioning calls on ESP32 */
@@ -820,6 +1346,7 @@ void komutIsle(String komut) {
       return;
     }
     nvsKaydet();
+    degasNvsKaydet(secili_goz);
     Serial.println("--> SERVİS AYARLARI KAYDEDİLDİ!");
     nextionGonder("b_save.bco=" + String(NEXTION_COLOR_GREEN));
     delay(600);
@@ -927,7 +1454,16 @@ void loop() {
     if (stm_bagli[i] && (millis() - stm_son_veri_zamani[i] > STM_BAGLANTI_TIMEOUT)) {
       stm_bagli[i] = false;
       makine_calisiyor[i] = false;
+      degas_active[i] = false;
+      degas_armed[i] = false;
       stm_relay[i] = 0;
+      kalan_saniye[i] = 0;
+      durum_metni[i] = "Kart Yok!";
+      if (i == secili_goz) {
+        nextionGonder("t_durum.txt=\"Kart Yok!\"");
+        nextionGonder("t_status.txt=\"Kart Yok!\"");
+        nextionGonder("b_degas.bco=" + String(NEXTION_COLOR_DEFAULT));
+      }
     }
   }
 
@@ -942,11 +1478,11 @@ void loop() {
     }
   }
 
-  // --- Periodic Heartbeat (1000ms) to prevent STM32 RX silence watchdog timeout during RUNNING ---
+  // --- Periodic Heartbeat (1000ms) to prevent STM32 RX silence watchdog timeout during RUNNING or DEGAS ---
   if (hil_heartbeat_active && (millis() - sonHeartbeatZamani >= 1000)) {
     sonHeartbeatZamani = millis();
     for (int i = 1; i < MAX_GOZ; i++) {
-      if (stm_bagli[i] && makine_calisiyor[i]) {
+      if (stm_bagli[i] && (makine_calisiyor[i] || degas_active[i])) {
         rs485Transmit("T" + String(i) + ":HEARTBEAT\n");
       }
     }

@@ -32,6 +32,16 @@ TIM_HandleTypeDef htim15;
 static volatile uint32_t current_delay_us    = TRIAC_MAX_DELAY_US;
 static volatile uint32_t last_zero_cross_tick = 0;
 
+typedef enum
+{
+  DEGAS_PULSE_STATE_ON = 0,
+  DEGAS_PULSE_STATE_OFF
+} DegasPulseState_t;
+
+static volatile DegasPulseState_t s_degas_pulse_state = DEGAS_PULSE_STATE_ON;
+static uint32_t s_degas_pulse_start_tick = 0U;
+static SystemMode_t s_pwm_prev_mode = SYS_MODE_IDLE;
+
 static uint32_t PowerPctToDelayUs(uint8_t power_pct)
 {
   uint32_t span = TRIAC_MAX_DELAY_US - TRIAC_MIN_DELAY_US;
@@ -116,17 +126,62 @@ void UltrasonicPWM_Init(void)
 
 void UltrasonicPWM_Process(void)
 {
-  if (g_system_state.mode != SYS_MODE_RUNNING)
+  SystemMode_t mode = g_system_state.mode;
+
+  if (mode != SYS_MODE_RUNNING && mode != SYS_MODE_DEGAS)
   {
+    s_degas_pulse_state = DEGAS_PULSE_STATE_ON;
+    s_pwm_prev_mode = mode;
     current_delay_us = TRIAC_MAX_DELAY_US; /* re-arm soft-start for next START */
     TriacForceOff();
     return;
   }
 
-  if ((HAL_GetTick() - last_zero_cross_tick) > ZERO_CROSS_TIMEOUT_MS)
+  uint32_t now = HAL_GetTick();
+
+  /* Mode transition into SYS_MODE_DEGAS: initialize pulse sub-state */
+  if (mode == SYS_MODE_DEGAS && s_pwm_prev_mode != SYS_MODE_DEGAS)
+  {
+    s_degas_pulse_state = DEGAS_PULSE_STATE_ON;
+    s_degas_pulse_start_tick = now;
+    current_delay_us = TRIAC_MAX_DELAY_US; /* re-arm soft-start for DEGAS startup */
+  }
+  s_pwm_prev_mode = mode;
+
+  /* Non-blocking pulse modulation logic in SYS_MODE_DEGAS */
+  if (mode == SYS_MODE_DEGAS && g_system_state.degas_config.pulse_off_ms > 0U)
+  {
+    if (s_degas_pulse_state == DEGAS_PULSE_STATE_ON)
+    {
+      if ((now - s_degas_pulse_start_tick) >= g_system_state.degas_config.pulse_on_ms)
+      {
+        s_degas_pulse_state = DEGAS_PULSE_STATE_OFF;
+        s_degas_pulse_start_tick = now;
+        TriacForceOff();
+        current_delay_us = TRIAC_MAX_DELAY_US; /* re-arm soft-start for next pulse ON */
+        g_system_state.actual_power_pct = 0U;
+        return;
+      }
+    }
+    else /* s_degas_pulse_state == DEGAS_PULSE_STATE_OFF */
+    {
+      TriacForceOff();
+      g_system_state.actual_power_pct = 0U;
+
+      if ((now - s_degas_pulse_start_tick) >= g_system_state.degas_config.pulse_off_ms)
+      {
+        s_degas_pulse_state = DEGAS_PULSE_STATE_ON;
+        s_degas_pulse_start_tick = now;
+        current_delay_us = TRIAC_MAX_DELAY_US; /* soft-start ramp on pulse ON */
+      }
+      return; /* In PULSE_OFF: do not execute firing or ZC timeout fault */
+    }
+  }
+
+  if ((now - last_zero_cross_tick) > ZERO_CROSS_TIMEOUT_MS)
   {
 #if ZC_BENCH_TEST_MODE
-    last_zero_cross_tick = HAL_GetTick(); /* pretend ZC is present, keep timer fed */
+    last_zero_cross_tick = now; /* pretend ZC is present, keep timer fed */
 #else
     SystemState_SafeStop(STOP_REASON_FAULT);
     g_system_state.fault_flags |= FAULT_ZERO_CROSS_LOST;
@@ -134,7 +189,8 @@ void UltrasonicPWM_Process(void)
 #endif
   }
 
-  uint32_t target_delay_us = PowerPctToDelayUs(g_system_state.setpoint_power_pct);
+  uint8_t power_pct = (mode == SYS_MODE_RUNNING) ? g_system_state.setpoint_power_pct : g_system_state.degas_config.power_pct;
+  uint32_t target_delay_us = PowerPctToDelayUs(power_pct);
 
   /* Soft-start: the delay only ever ramps DOWN toward the target (never
    * jumps up), so conduction angle - and power - rises gradually. */
@@ -166,9 +222,20 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 
   last_zero_cross_tick = HAL_GetTick();
 
-  if (g_system_state.mode != SYS_MODE_RUNNING)
+  if (g_system_state.mode == SYS_MODE_RUNNING)
   {
-    return;
+    /* Always proceed in RUNNING mode */
+  }
+  else if (g_system_state.mode == SYS_MODE_DEGAS)
+  {
+    if (g_system_state.degas_config.pulse_off_ms > 0U && s_degas_pulse_state == DEGAS_PULSE_STATE_OFF)
+    {
+      return; /* Drop edge during PULSE_OFF */
+    }
+  }
+  else
+  {
+    return; /* Drop edge in IDLE, FAULT, or other non-operational state */
   }
 
   uint32_t delay_us = current_delay_us;

@@ -94,20 +94,6 @@ static void MX_IWDG_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* Reads the 4 DIP switch GPIOs (active-low, pull-up).
- * Returns 1..10 for valid IDs; returns 0 for unconfigured/invalid combinations. */
-static uint8_t ReadDipSwitchId(void)
-{
-  uint8_t raw = 0U;
-  if (HAL_GPIO_ReadPin(DIP_SW1_GPIO_Port, DIP_SW1_Pin) == GPIO_PIN_RESET) raw |= 0x01U;
-  if (HAL_GPIO_ReadPin(DIP_SW2_GPIO_Port, DIP_SW2_Pin) == GPIO_PIN_RESET) raw |= 0x02U;
-  if (HAL_GPIO_ReadPin(DIP_SW3_GPIO_Port, DIP_SW3_Pin) == GPIO_PIN_RESET) raw |= 0x04U;
-  if (HAL_GPIO_ReadPin(DIP_SW4_GPIO_Port, DIP_SW4_Pin) == GPIO_PIN_RESET) raw |= 0x08U;
-
-  if (raw >= 1U && raw <= 10U) return raw;
-  return 0U;
-}
-
 #define STAGING_TIMEOUT_MS  10000U
 static uint32_t s_staging_start_tick = 0U;
 static uint8_t  s_staging_active     = 0U;
@@ -390,6 +376,7 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_ADC1_Init();
+  HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
   MX_ADC2_Init();
   MX_OPAMP3_Init();
   MX_TIM1_Init();
@@ -417,18 +404,8 @@ int main(void)
     }
     else
     {
-      uint8_t dip_id = ReadDipSwitchId();
-
-      if (dip_id >= 1U && dip_id <= 10U)
-      {
-        MY_TANK_ID = dip_id;
-        g_system_state.prov_state = PROV_STATE_ACTIVE;
-      }
-      else
-      {
-        MY_TANK_ID = 0U;
-        g_system_state.prov_state = PROV_STATE_UNCOMMISSIONED;
-      }
+      MY_TANK_ID = 0U;
+      g_system_state.prov_state = PROV_STATE_UNCOMMISSIONED;
     }
   }
 #endif
@@ -456,6 +433,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     ESP32_UART_Process();
+    X9C103S_SweepProcess();
     PT100_ADC_Process();
     HeaterRelay_Process();
     UltrasonicPWM_Process();
@@ -913,12 +891,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : DIP_SW1_Pin DIP_SW2_Pin DIP_SW3_Pin DIP_SW4_Pin */
-  GPIO_InitStruct.Pin = DIP_SW1_Pin|DIP_SW2_Pin|DIP_SW3_Pin|DIP_SW4_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/

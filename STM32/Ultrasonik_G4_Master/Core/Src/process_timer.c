@@ -21,7 +21,7 @@ void ProcessTimer_Process(void)
 {
   SystemMode_t mode = g_system_state.mode;
 
-  /* Reload the countdown on every ->RUNNING transition (START command) */
+  /* Reload the countdown on transition into SYS_MODE_RUNNING or SYS_MODE_DEGAS */
   if ((mode == SYS_MODE_RUNNING) && (prev_mode != SYS_MODE_RUNNING))
   {
     g_system_state.remaining_seconds = (uint16_t)(g_system_state.setpoint_time_minutes * 60u);
@@ -34,9 +34,21 @@ void ProcessTimer_Process(void)
       mode = SYS_MODE_IDLE;
     }
   }
+  else if ((mode == SYS_MODE_DEGAS) && (prev_mode != SYS_MODE_DEGAS))
+  {
+    g_system_state.remaining_seconds = (uint16_t)(g_system_state.degas_config.duration_minutes * 60u);
+    last_tick_ms = HAL_GetTick();
+
+    if (g_system_state.remaining_seconds == 0u)
+    {
+      /* 0-minute duration: auto-stop immediately */
+      SystemState_SafeStop(STOP_REASON_TIMER_ZERO);
+      mode = SYS_MODE_IDLE;
+    }
+  }
   prev_mode = mode;
 
-  if (mode != SYS_MODE_RUNNING)
+  if (mode != SYS_MODE_RUNNING && mode != SYS_MODE_DEGAS)
   {
     return;
   }

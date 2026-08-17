@@ -6,9 +6,126 @@
   ******************************************************************************
   */
 #include "x9c103s.h"
+#include "system_state.h"
 
 static uint8_t s_current_step = 0U;
 static uint8_t s_current_freq = 28U;
+
+/* ------------------------------------------------------------
+ * Frequency sweep configuration
+ *
+ * Full cycle:
+ *   26 -> 27 -> 28 -> 29 -> 30 -> 29 -> 28 -> 27 -> 26
+ *
+ * 50 ms per frequency point transition
+ * 8 transitions = 400 ms complete triangle cycle.
+ * ------------------------------------------------------------ */
+#define X9C_SWEEP_PERIOD_MS       400U
+#define X9C_SWEEP_POINT_MS         50U
+#define X9C_SWEEP_INDEX_COUNT       9U
+
+static const int8_t s_sweep_offsets[X9C_SWEEP_INDEX_COUNT] =
+{
+  -2, -1, 0, 1, 2, 1, 0, -1, -2
+};
+
+static uint8_t  s_sweep_enabled       = 0U;
+static uint8_t  s_sweep_center_freq   = 28U;
+static uint8_t  s_sweep_index         = 0U;
+static uint32_t s_sweep_last_tick     = 0U;
+static uint8_t  s_step_increment     = DEFAULT_STEP_INCREMENT;
+static uint8_t  s_sweep_span_khz     = DEFAULT_SWEEP_SPAN_KHZ;
+static uint16_t s_sweep_period_ms    = DEFAULT_SWEEP_PERIOD_MS;
+
+HAL_StatusTypeDef X9C103S_SetStepIncrement(uint8_t inc)
+{
+  if (inc < 1U || inc > 8U)
+  {
+    return HAL_ERROR;
+  }
+  s_step_increment = inc;
+  return HAL_OK;
+}
+
+uint8_t X9C103S_GetStepIncrement(void)
+{
+  return s_step_increment;
+}
+
+HAL_StatusTypeDef X9C103S_SetSweepSpan(uint8_t span_khz)
+{
+  if (span_khz < 1U || span_khz > 4U)
+  {
+    return HAL_ERROR;
+  }
+  s_sweep_span_khz = span_khz;
+  return HAL_OK;
+}
+
+uint8_t X9C103S_GetSweepSpan(void)
+{
+  return s_sweep_span_khz;
+}
+
+HAL_StatusTypeDef X9C103S_SetSweepPeriod(uint16_t period_ms)
+{
+  if (period_ms < 100U || period_ms > 1000U)
+  {
+    return HAL_ERROR;
+  }
+  s_sweep_period_ms = period_ms;
+  return HAL_OK;
+}
+
+uint16_t X9C103S_GetSweepPeriod(void)
+{
+  return s_sweep_period_ms;
+}
+
+static uint8_t X9C103S_SweepStepForFrequency(uint8_t freq_khz)
+{
+  /*
+   * Two-point calibration:
+   *   28 kHz -> step 40
+   *   40 kHz -> step 90
+   *
+   * Linear interpolation is used for the intermediate sweep points.
+   */
+  if (freq_khz <= 28U)
+  {
+    int32_t delta = (int32_t)freq_khz - 28;
+    int32_t step = 40 + ((delta * 50) / 12);
+
+    if (step < 0)
+    {
+      step = 0;
+    }
+
+    if (step > 99)
+    {
+      step = 99;
+    }
+
+    return (uint8_t)step;
+  }
+
+  {
+    int32_t delta = (int32_t)freq_khz - 28;
+    int32_t step = 40 + ((delta * 50 + 6) / 12);
+
+    if (step < 0)
+    {
+      step = 0;
+    }
+
+    if (step > 99)
+    {
+      step = 99;
+    }
+
+    return (uint8_t)step;
+  }
+}
 
 /**
   * @brief  Short microsecond-scale delay helper for X9C103S pulse timing.
@@ -56,6 +173,7 @@ void X9C103S_Init(void)
   __set_PRIMASK(primask);
 
   s_current_step = 0U;
+  s_step_increment = DEFAULT_STEP_INCREMENT;
 
   /* Set default frequency (28 kHz -> step 40) directly after reset */
   (void)X9C103S_SetFrequency(28U);
@@ -137,6 +255,110 @@ HAL_StatusTypeDef X9C103S_SetFrequency(uint8_t freq_khz)
   {
     return HAL_ERROR;
   }
+}
+
+void X9C103S_SetSweepEnabled(uint8_t enabled)
+{
+  if (enabled != 0U)
+  {
+    /* Sweep can only be enabled around the actual selected center. */
+    if (s_current_freq != 28U && s_current_freq != 40U)
+    {
+      s_current_freq = 28U;
+      (void)X9C103S_SetFrequency(28U);
+    }
+
+    s_sweep_center_freq = s_current_freq;
+    s_sweep_index = 0U;
+    s_sweep_last_tick = HAL_GetTick();
+    s_sweep_enabled = 1U;
+
+    /*
+     * Parametric start immediately at the lower endpoint:
+     * target_step = BASE_STEP + (offset * STEP_INCREMENT)
+     * Wiper is only driven when system mode is SYS_MODE_RUNNING.
+     * In SYS_MODE_IDLE, sweep selection is armed (sweep_enabled = 1) without wiper stepping.
+     */
+    if (g_system_state.mode == SYS_MODE_RUNNING)
+    {
+      int16_t base_step = (s_sweep_center_freq == 40U) ? (int16_t)X9C_STEP_40KHZ : (int16_t)X9C_STEP_28KHZ;
+      int16_t target_step = base_step + ((int16_t)s_sweep_offsets[s_sweep_index] * (int16_t)s_step_increment);
+
+      if (target_step < 0)
+      {
+        target_step = 0;
+      }
+      if (target_step >= (int16_t)X9C_MAX_STEPS)
+      {
+        target_step = (int16_t)(X9C_MAX_STEPS - 1U);
+      }
+
+      (void)X9C103S_SetStep((uint8_t)target_step);
+    }
+  }
+  else
+  {
+    s_sweep_enabled = 0U;
+    s_sweep_index = 0U;
+    s_sweep_last_tick = HAL_GetTick();
+
+    /* Always restore exact center frequency when sweep stops. */
+    (void)X9C103S_SetFrequency(s_sweep_center_freq);
+  }
+}
+
+uint8_t X9C103S_IsSweepEnabled(void)
+{
+  return s_sweep_enabled;
+}
+
+void X9C103S_SweepProcess(void)
+{
+  if (s_sweep_enabled == 0U)
+  {
+    return;
+  }
+
+  uint32_t now = HAL_GetTick();
+  uint32_t point_ms = (uint32_t)(s_sweep_period_ms / (X9C_SWEEP_INDEX_COUNT - 1U));
+  if (point_ms == 0U)
+  {
+    point_ms = 50U;
+  }
+
+  if ((uint32_t)(now - s_sweep_last_tick) < point_ms)
+  {
+    return;
+  }
+
+  s_sweep_last_tick = now;
+
+  /*
+   * Advance through:
+   * -2, -1, 0, +1, +2, +1, 0, -1, -2
+   */
+  if (s_sweep_index < (X9C_SWEEP_INDEX_COUNT - 1U))
+  {
+    s_sweep_index++;
+  }
+  else
+  {
+    s_sweep_index = 0U;
+  }
+
+  int16_t base_step = (s_sweep_center_freq == 40U) ? (int16_t)X9C_STEP_40KHZ : (int16_t)X9C_STEP_28KHZ;
+  int16_t target_step = base_step + ((int16_t)s_sweep_offsets[s_sweep_index] * (int16_t)s_step_increment);
+
+  if (target_step < 0)
+  {
+    target_step = 0;
+  }
+  if (target_step >= (int16_t)X9C_MAX_STEPS)
+  {
+    target_step = (int16_t)(X9C_MAX_STEPS - 1U);
+  }
+
+  (void)X9C103S_SetStep((uint8_t)target_step);
 }
 
 uint8_t X9C103S_GetCurrentStep(void)
