@@ -363,13 +363,14 @@ void X9C103S_SetSweepEnabled(uint8_t enabled)
   }
   else
   {
-    if (s_sweep_enabled != 0U)
-    {
-      s_sweep_enabled = 0U;
-      s_sweep_index = 0U;
-      s_sweep_last_tick = HAL_GetTick();
+    uint8_t was_enabled = s_sweep_enabled;
+    s_sweep_enabled = 0U;
+    s_sweep_index = 0U;
+    s_sweep_last_tick = HAL_GetTick();
 
-      /* Always restore exact center frequency when sweep stops. */
+    /* Always restore exact center frequency when sweep stops. */
+    if (was_enabled != 0U || s_current_step != ((s_sweep_center_freq == 40U) ? X9C_STEP_40KHZ : X9C_STEP_28KHZ))
+    {
       (void)X9C103S_SetFrequency(s_sweep_center_freq);
     }
   }
@@ -382,7 +383,7 @@ uint8_t X9C103S_IsSweepEnabled(void)
 
 void X9C103S_SweepProcess(void)
 {
-  if (s_sweep_enabled == 0U)
+  if (s_sweep_enabled == 0U || g_system_state.mode != SYS_MODE_RUNNING)
   {
     return;
   }

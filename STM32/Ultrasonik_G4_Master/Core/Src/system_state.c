@@ -8,6 +8,7 @@
 #include "heater_relay.h"
 #include "ultrasonic_pwm.h"
 #include "esp32_uart.h"
+#include "x9c103s.h"
 #include <stdio.h>
 #include <stddef.h>
 #include <string.h>
@@ -153,6 +154,9 @@ void SystemState_SafeStop(StopReason_t reason)
   g_system_state.softstart_delay_us = TRIAC_MAX_DELAY_US;
   g_system_state.actual_power_pct   = 0u;
 
-  /* 5. Transmit immediate telemetry status update */
+  /* 5. Disarms sweep and restores center frequency */
+  X9C103S_SetSweepEnabled(0U);
+
+  /* 6. Transmit immediate telemetry status update */
   ESP32_UART_SendStatus();
 }

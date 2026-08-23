@@ -44,10 +44,13 @@ extern UART_HandleTypeDef hlpuart1;  // HIL_TEST_MOD: ST-Link VCP (COM11), telem
 #define TX_LINE_MAX  64u
 #define RX_SILENCE_TIMEOUT_MS 3000U
 
+#define UART_FIFO_SIZE 256U
 static uint8_t rx_byte;
-static char rx_line[RX_LINE_MAX];
-static volatile uint16_t rx_index = 0;
-static volatile uint8_t line_ready = 0;
+static volatile uint8_t s_rx_fifo[UART_FIFO_SIZE];
+static volatile uint16_t s_rx_fifo_head = 0U;
+static volatile uint16_t s_rx_fifo_tail = 0U;
+static char s_rx_line_buf[RX_LINE_MAX];
+static uint16_t s_rx_line_len = 0U;
 
 static char tx_line[TX_LINE_MAX];
 static volatile uint8_t tx_busy = 0;
@@ -117,8 +120,9 @@ static void RS485_Transmit_Blocking(const uint8_t *pData, uint16_t Size, uint32_
 void ESP32_UART_Init(void)
 {
   RS485_RX_ENABLE();
-  rx_index = 0;
-  line_ready = 0;
+  s_rx_fifo_head = 0U;
+  s_rx_fifo_tail = 0U;
+  s_rx_line_len = 0U;
   tx_busy = 0;
   s_discover_pending = 0;
   s_discover_start_tick = 0;
@@ -159,18 +163,32 @@ void ESP32_UART_Process(void)
     }
   }
 
-  if (!line_ready)
+  while (s_rx_fifo_head != s_rx_fifo_tail)
   {
-    return;
+    uint8_t c = s_rx_fifo[s_rx_fifo_tail];
+    s_rx_fifo_tail = (uint16_t)((s_rx_fifo_tail + 1U) % UART_FIFO_SIZE);
+
+    if (c == '\n' || c == '\r')
+    {
+      if (s_rx_line_len > 0U)
+      {
+        s_rx_line_buf[s_rx_line_len] = '\0';
+        char process_buf[RX_LINE_MAX];
+        memcpy(process_buf, s_rx_line_buf, s_rx_line_len + 1U);
+        s_rx_line_len = 0U;
+        ProcessLine(process_buf);
+      }
+    }
+    else if (s_rx_line_len < (RX_LINE_MAX - 1U))
+    {
+      s_rx_line_buf[s_rx_line_len++] = (char)c;
+    }
+    else
+    {
+      s_rx_line_len = 0U;
+      g_bus_diag.rx_dropped_count++;
+    }
   }
-
-  char line[RX_LINE_MAX];
-  memcpy(line, rx_line, sizeof(line));
-
-  rx_index = 0;
-  line_ready = 0;
-
-  ProcessLine(line);
 }
 
 static void ProcessLine(const char *line)
@@ -256,9 +274,12 @@ static void ProcessLine(const char *line)
     }
     X9C103S_SetSweepEnabled(1U);
     {
-      const char *ack_msg = "ACK:SWEEP:ON,PERIOD_MS=400,SPAN=+-2KHZ\n";
-      RS485_Transmit_Blocking((const uint8_t *)ack_msg, (uint16_t)strlen(ack_msg), 10);
-      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ack_msg, (uint16_t)strlen(ack_msg), 10);
+      char ack_msg[64];
+      int ack_len = snprintf(ack_msg, sizeof(ack_msg), "ACK:SWEEP:ON,PERIOD_MS=%u,SPAN=+-%uKHZ\n",
+                             (unsigned int)X9C103S_GetSweepPeriod(),
+                             (unsigned int)X9C103S_GetSweepSpan());
+      RS485_Transmit_Blocking((const uint8_t *)ack_msg, (uint16_t)ack_len, 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ack_msg, (uint16_t)ack_len, 10);
     }
     return;
   }
@@ -391,7 +412,11 @@ static void ProcessLine(const char *line)
   }
   else if (strcmp(cmd, "STOP") == 0)
   {
-    /* STOP acts as manual user stop and disarms outputs without wiping fault flags if faulted */
+    /* STOP acts as manual user stop, clears transient communication faults, and disarms outputs */
+    if (g_system_state.fault_flags == FAULT_COMM_TIMEOUT)
+    {
+      g_system_state.fault_flags = FAULT_NONE;
+    }
     SystemState_SafeStop(STOP_REASON_USER_STOP);
   }
   else if (strcmp(cmd, "CLEAR_FAULT") == 0 || strcmp(cmd, "FAULT_CLEAR") == 0)
@@ -575,16 +600,18 @@ static void ProcessLine(const char *line)
     long freq = strtol(&cmd[9], &endptr, 10);
     if (endptr != &cmd[9] && (freq == 28 || freq == 40))
     {
-      /* SWP-GAP-001 / ADR-02 / SWP-REQ-009: Frequency change terminates any active sweep state */
-      X9C103S_SetSweepEnabled(0U);
+      if ((uint8_t)freq != g_system_state.frequency_khz)
+      {
+        /* SWP-GAP-001 / ADR-02 / SWP-REQ-009: Frequency change terminates any active sweep state */
+        X9C103S_SetSweepEnabled(0U);
 
-      g_system_state.frequency_khz = (uint8_t)freq;
-      (void)X9C103S_SetFrequency((uint8_t)freq);
+        g_system_state.frequency_khz = (uint8_t)freq;
+        (void)X9C103S_SetFrequency((uint8_t)freq);
 
-      const char *log_msg = (freq == 28) ? "LOG:FREQ_28KHZ_SET_STEP_40_4KOHM\n"
-                                         : "LOG:FREQ_40KHZ_SET_STEP_90_9KOHM\n";
-      RS485_Transmit_Blocking((const uint8_t *)log_msg, (uint16_t)strlen(log_msg), 10);
-      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)log_msg, (uint16_t)strlen(log_msg), 10);
+        const char *log_msg = (freq == 28) ? "LOG:FREQ_28KHZ_SET_STEP_40_4KOHM\n"
+                                           : "LOG:FREQ_40KHZ_SET_STEP_90_9KOHM\n";
+        HAL_UART_Transmit(&hlpuart1, (const uint8_t *)log_msg, (uint16_t)strlen(log_msg), 10);
+      }
     }
     else
     {
@@ -770,31 +797,16 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     return;
   }
 
-  if (!line_ready)
+  uint16_t next_head = (uint16_t)((s_rx_fifo_head + 1U) % UART_FIFO_SIZE);
+  if (next_head != s_rx_fifo_tail)
   {
-    if (rx_byte == '\n')
-    {
-      /* strip a preceding '\r' if present */
-      if (rx_index > 0 && rx_line[rx_index - 1] == '\r')
-      {
-        rx_index--;
-      }
-      rx_line[rx_index] = '\0';
-      line_ready = 1;
-    }
-    else if (rx_index < (RX_LINE_MAX - 1))
-    {
-      rx_line[rx_index++] = (char)rx_byte;
-    }
-    else
-    {
-      /* line too long, discard it and resync on the next '\n' */
-      rx_index = 0;
-      g_bus_diag.rx_dropped_count++;
-    }
+    s_rx_fifo[s_rx_fifo_head] = rx_byte;
+    s_rx_fifo_head = next_head;
   }
-  /* if line_ready is still set (previous line not yet consumed), incoming
-   * bytes are dropped until ESP32_UART_Process() catches up */
+  else
+  {
+    g_bus_diag.rx_dropped_count++;
+  }
 
   HAL_UART_Receive_IT(&huart3, &rx_byte, 1);
 }
@@ -829,7 +841,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
    * discard the partial line and immediately re-arm so a single glitch
    * never permanently silences the link (RX must never be left dead). */
   RS485_RX_ENABLE();
-  rx_index = 0;
+  s_rx_line_len = 0U;
   g_bus_diag.rx_dropped_count++;
   tx_busy = 0; /* Reset TX lockup state so status transmission recovers after error */
 
