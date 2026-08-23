@@ -29,6 +29,7 @@
 #include "process_timer.h"
 #include "x9c103s.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>  // HIL_DEEP_DEBUG: snprintf for the COM11 debug stream
 /* USER CODE END Includes */
 
@@ -324,14 +325,166 @@ static void BenchTest_Process(void)
   }
 }
 
+static uint8_t s_lpuart_rx_buf[64];
+static uint8_t s_lpuart_rx_idx = 0;
+static uint8_t s_x9c_bench_active = 0;
+static uint32_t s_last_bench_stream_tick = 0;
+
+static void LPUART1_Process(void)
+{
+  if (__HAL_UART_GET_FLAG(&hlpuart1, UART_FLAG_ORE) != RESET)
+  {
+    __HAL_UART_CLEAR_FLAG(&hlpuart1, UART_CLEAR_OREF);
+  }
+  if (__HAL_UART_GET_FLAG(&hlpuart1, UART_FLAG_NE | UART_FLAG_FE | UART_FLAG_PE) != RESET)
+  {
+    __HAL_UART_CLEAR_FLAG(&hlpuart1, UART_CLEAR_NEF | UART_CLEAR_FEF | UART_CLEAR_PEF);
+  }
+
+  while (__HAL_UART_GET_FLAG(&hlpuart1, UART_FLAG_RXNE) != RESET)
+  {
+    uint8_t ch = (uint8_t)(hlpuart1.Instance->RDR & 0xFF);
+    if (ch == '\n' || ch == '\r')
+    {
+      if (s_lpuart_rx_idx > 0)
+      {
+        s_lpuart_rx_buf[s_lpuart_rx_idx] = '\0';
+        char *cmd = (char *)s_lpuart_rx_buf;
+        while (*cmd == ' ') cmd++;
+
+        if (strcmp(cmd, "X9C_TEST:FREQ28") == 0 || strcmp(cmd, "SET_FREQ:28") == 0)
+        {
+          X9C103S_SetSweepEnabled(0);
+          (void)X9C103S_SetFrequency(28);
+          s_x9c_bench_active = 1;
+          const char *msg = "ACK:X9C_TEST:FREQ28\r\n";
+          HAL_UART_Transmit(&hlpuart1, (const uint8_t *)msg, (uint16_t)strlen(msg), 10);
+        }
+        else if (strcmp(cmd, "X9C_TEST:FREQ40") == 0 || strcmp(cmd, "SET_FREQ:40") == 0)
+        {
+          X9C103S_SetSweepEnabled(0);
+          (void)X9C103S_SetFrequency(40);
+          s_x9c_bench_active = 1;
+          const char *msg = "ACK:X9C_TEST:FREQ40\r\n";
+          HAL_UART_Transmit(&hlpuart1, (const uint8_t *)msg, (uint16_t)strlen(msg), 10);
+        }
+        else if (strncmp(cmd, "X9C_TEST:STEP", 13) == 0)
+        {
+          uint8_t stp = (uint8_t)atoi(&cmd[13]);
+          X9C103S_SetSweepEnabled(0);
+          (void)X9C103S_SetStep(stp);
+          s_x9c_bench_active = 1;
+          char ack[40];
+          int acklen = snprintf(ack, sizeof(ack), "ACK:X9C_TEST:STEP%u\r\n", stp);
+          HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ack, (uint16_t)acklen, 10);
+        }
+        else if (strcmp(cmd, "X9C_TEST:SWEEP28") == 0)
+        {
+          (void)X9C103S_SetFrequency(28);
+          X9C103S_SetSweepEnabled(1);
+          s_x9c_bench_active = 1;
+          const char *msg = "ACK:X9C_TEST:SWEEP28\r\n";
+          HAL_UART_Transmit(&hlpuart1, (const uint8_t *)msg, (uint16_t)strlen(msg), 10);
+        }
+        else if (strcmp(cmd, "X9C_TEST:SWEEP40") == 0)
+        {
+          (void)X9C103S_SetFrequency(40);
+          X9C103S_SetSweepEnabled(1);
+          s_x9c_bench_active = 1;
+          const char *msg = "ACK:X9C_TEST:SWEEP40\r\n";
+          HAL_UART_Transmit(&hlpuart1, (const uint8_t *)msg, (uint16_t)strlen(msg), 10);
+        }
+        else if (strcmp(cmd, "X9C_TEST:STOP") == 0 || strcmp(cmd, "SWEEP:OFF") == 0)
+        {
+          X9C103S_SetSweepEnabled(0);
+          s_x9c_bench_active = 0;
+          const char *msg = "ACK:X9C_TEST:STOP\r\n";
+          HAL_UART_Transmit(&hlpuart1, (const uint8_t *)msg, (uint16_t)strlen(msg), 10);
+        }
+        else if (strncmp(cmd, "SET_STEP_INC:", 13) == 0)
+        {
+          uint8_t inc = (uint8_t)atoi(&cmd[13]);
+          (void)X9C103S_SetStepIncrement(inc);
+          char ack[40];
+          int acklen = snprintf(ack, sizeof(ack), "ACK:STEP_INC:%u\r\n", inc);
+          HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ack, (uint16_t)acklen, 10);
+        }
+        else if (strncmp(cmd, "SET_SWP_SPAN:", 13) == 0)
+        {
+          uint8_t span = (uint8_t)atoi(&cmd[13]);
+          (void)X9C103S_SetSweepSpan(span);
+          char ack[40];
+          int acklen = snprintf(ack, sizeof(ack), "ACK:SWP_SPAN:%u\r\n", span);
+          HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ack, (uint16_t)acklen, 10);
+        }
+        else if (strncmp(cmd, "SET_SWP_PER:", 12) == 0)
+        {
+          uint16_t per = (uint16_t)atoi(&cmd[12]);
+          (void)X9C103S_SetSweepPeriod(per);
+          char ack[40];
+          int acklen = snprintf(ack, sizeof(ack), "ACK:SWP_PER:%u\r\n", per);
+          HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ack, (uint16_t)acklen, 10);
+        }
+        else if (strcmp(cmd, "SWEEP:ON") == 0)
+        {
+          X9C103S_SetSweepEnabled(1);
+          s_x9c_bench_active = 1;
+          char ack[64];
+          int acklen = snprintf(ack, sizeof(ack), "ACK:SWEEP:ON,PERIOD_MS=%u,SPAN=+-%uKHZ\r\n",
+                                (unsigned int)X9C103S_GetSweepPeriod(),
+                                (unsigned int)X9C103S_GetSweepSpan());
+          HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ack, (uint16_t)acklen, 10);
+        }
+        s_lpuart_rx_idx = 0;
+      }
+    }
+    else if (s_lpuart_rx_idx < sizeof(s_lpuart_rx_buf) - 1)
+    {
+      if (ch >= 32 && ch <= 126)
+      {
+        s_lpuart_rx_buf[s_lpuart_rx_idx++] = ch;
+      }
+    }
+  }
+
+  /* 20 Hz (50 ms) Telemetry stream when bench active */
+  if (s_x9c_bench_active && (HAL_GetTick() - s_last_bench_stream_tick) >= 50u)
+  {
+    s_last_bench_stream_tick = HAL_GetTick();
+    uint16_t raw = PA0_ADC1_GetLastRaw();
+    uint32_t mv = ((uint32_t)raw * 3300U + 2047U) / 4095U;
+    char logbuf[160];
+    int len = snprintf(logbuf, sizeof(logbuf),
+                       "X9C_TEST,t_ms=%lu,target=%u,actual=%u,adc_raw=%u,adc_v=%lu.%03lu,cs=%s,ud=%s,inc=%s\r\n",
+                       (unsigned long)HAL_GetTick(),
+                       (unsigned int)X9C103S_GetTargetStep(),
+                       (unsigned int)X9C103S_GetCurrentStep(),
+                       (unsigned int)raw,
+                       (unsigned long)(mv / 1000U),
+                       (unsigned long)(mv % 1000U),
+                       (HAL_GPIO_ReadPin(X9C_CS_GPIO_Port, X9C_CS_Pin) == GPIO_PIN_SET) ? "HIGH" : "LOW",
+                       (HAL_GPIO_ReadPin(X9C_UD_GPIO_Port, X9C_UD_Pin) == GPIO_PIN_SET) ? "HIGH" : "LOW",
+                       (HAL_GPIO_ReadPin(X9C_INC_GPIO_Port, X9C_INC_Pin) == GPIO_PIN_SET) ? "HIGH" : "LOW");
+    if (len > 0)
+    {
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)logbuf, (uint16_t)len, 10);
+    }
+  }
+}
+
 /* HIL_DEEP_DEBUG: white-box internals, printed only from the main superloop (never an ISR)
  * onto the ST-Link VCP (COM11) so the HIL test host can verify internal MCU math/logic
  * (raw ADC counts, triac firing delay, relay bit) that the STAT telegram never exposes. */
 static void HIL_DeepDebug_Print(void)
 {
-  char buf[128];
-  int len = snprintf(buf, sizeof(buf), "DEBUG_STM: ADC=%lu, DELAY=%lu, RELAY=%u, HEATER_OUT=%u, HEATER_FB=%u, TRIAC_OUT=%u, TRIAC_FB=%u\r\n",
+  uint16_t pa0_raw = PA0_ADC1_GetLastRaw();
+  uint32_t pa0_mv = ((uint32_t)pa0_raw * 3300U + 2047U) / 4095U;
+  char buf[160];
+  int len = snprintf(buf, sizeof(buf), "DEBUG_STM: PT100_ADC=%lu, PA0_ADC=%u, PA0_V=%lu.%03lu, DELAY=%lu, RELAY=%u, HEATER_OUT=%u, HEATER_FB=%u, TRIAC_OUT=%u, TRIAC_FB=%u\r\n",
                       (unsigned long)PT100_ADC_GetLastRaw(),
+                      (unsigned int)pa0_raw,
+                      (unsigned long)(pa0_mv / 1000U),
+                      (unsigned long)(pa0_mv % 1000U),
                       (unsigned long)UltrasonicPWM_GetCurrentDelayUs(),
                       (unsigned int)g_system_state.relay_state,
                       (unsigned int)(HAL_GPIO_ReadPin(HEATER_RELAY_GPIO_Port, HEATER_RELAY_Pin) == GPIO_PIN_SET ? 1 : 0),
@@ -435,6 +588,8 @@ int main(void)
     ESP32_UART_Process();
     X9C103S_SweepProcess();
     PT100_ADC_Process();
+    PA0_ADC1_Process();
+    LPUART1_Process();
     HeaterRelay_Process();
     UltrasonicPWM_Process();
     ProcessTimer_Process();
@@ -543,7 +698,7 @@ static void MX_ADC1_Init(void)
 
   sConfig.Channel = ADC_CHANNEL_1; /* PA0 = ADC1_IN1 */
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_640CYCLES_5; /* 640.5 cycles (15 us) settling time for 1k-3.5k ohm source impedance */
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;

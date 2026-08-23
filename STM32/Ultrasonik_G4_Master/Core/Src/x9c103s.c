@@ -82,97 +82,80 @@ uint16_t X9C103S_GetSweepPeriod(void)
   return s_sweep_period_ms;
 }
 
-static uint8_t X9C103S_SweepStepForFrequency(uint8_t freq_khz)
-{
-  /*
-   * Two-point calibration:
-   *   28 kHz -> step 40
-   *   40 kHz -> step 90
-   *
-   * Linear interpolation is used for the intermediate sweep points.
-   */
-  if (freq_khz <= 28U)
-  {
-    int32_t delta = (int32_t)freq_khz - 28;
-    int32_t step = 40 + ((delta * 50) / 12);
+extern ADC_HandleTypeDef hadc1;
 
-    if (step < 0)
-    {
-      step = 0;
-    }
-
-    if (step > 99)
-    {
-      step = 99;
-    }
-
-    return (uint8_t)step;
-  }
-
-  {
-    int32_t delta = (int32_t)freq_khz - 28;
-    int32_t step = 40 + ((delta * 50 + 6) / 12);
-
-    if (step < 0)
-    {
-      step = 0;
-    }
-
-    if (step > 99)
-    {
-      step = 99;
-    }
-
-    return (uint8_t)step;
-  }
-}
+static uint8_t s_target_step = 40U;
+static volatile uint16_t s_pa0_adc_raw = 0U;
+static volatile float s_pa0_adc_voltage = 0.0f;
+static volatile uint32_t s_total_pulses_sent = 0U;
 
 /**
-  * @brief  Short microsecond-scale delay helper for X9C103S pulse timing.
-  *         STM32G4 operates at 170 MHz (1 us ~ 170 cycles).
-  * @param  us: Delay duration in microseconds.
+  * @brief  Cycle-accurate microsecond delay using Cortex-M4 DWT Cycle Counter.
+  *         At 170 MHz CPU clock, 1 microsecond = 170 CPU cycles.
   */
+static inline void DWT_Init(void)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
 static void X9C_DelayUs(uint32_t us)
 {
-  uint32_t count = us * 45U;
-  for (volatile uint32_t i = 0U; i < count; i++)
+  uint32_t start = DWT->CYCCNT;
+  uint32_t cycles = us * (SystemCoreClock / 1000000UL);
+  while ((DWT->CYCCNT - start) < cycles)
   {
-    __asm__ volatile("");
+    __NOP();
   }
 }
 
 void X9C103S_Init(void)
 {
+  DWT_Init();
+
   /* Protect initial wiper zeroing sequence from Zero-Cross / Timer interrupt preemption */
   uint32_t primask = __get_PRIMASK();
   __disable_irq();
 
-  /* Ensure CS and INC are idle HIGH, U/D LOW */
+  /* 1. Ensure CS and INC are idle HIGH, U/D LOW (DOWN direction) */
   HAL_GPIO_WritePin(X9C_CS_GPIO_Port, X9C_CS_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(X9C_INC_GPIO_Port, X9C_INC_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(X9C_UD_GPIO_Port, X9C_UD_Pin, GPIO_PIN_RESET); /* Down */
 
-  X9C_DelayUs(5U); /* t_ID setup time (>= 2.9 us) */
+  X9C_DelayUs(10U); /* t_ID / t_DI setup time (>= 2.9 us) */
 
-  /* Reset wiper to known zero position by sending 100 DOWN pulses */
+  /* 2. Select device (CS LOW) to begin wiper zeroing */
   HAL_GPIO_WritePin(X9C_CS_GPIO_Port, X9C_CS_Pin, GPIO_PIN_RESET);
-  X9C_DelayUs(3U); /* t_CI setup time (>= 100 ns) */
+  X9C_DelayUs(5U); /* t_CI setup time (>= 100 ns) */
 
+  /* 3. Send 100 DOWN pulses to drive wiper to physical terminal VL (Tap 0) */
   for (uint8_t i = 0U; i < X9C_MAX_STEPS; i++)
   {
+    /* Negative edge (HIGH -> LOW) steps wiper DOWN */
     HAL_GPIO_WritePin(X9C_INC_GPIO_Port, X9C_INC_Pin, GPIO_PIN_RESET);
-    X9C_DelayUs(3U); /* t_INC LOW width (>= 1 us) */
-    HAL_GPIO_WritePin(X9C_INC_GPIO_Port, X9C_INC_Pin, GPIO_PIN_SET);
-    X9C_DelayUs(3U); /* t_INC HIGH width (>= 1 us) */
+    X9C_DelayUs(5U); /* t_IL LOW width (>= 1 us) */
+
+    if (i < (X9C_MAX_STEPS - 1U))
+    {
+      HAL_GPIO_WritePin(X9C_INC_GPIO_Port, X9C_INC_Pin, GPIO_PIN_SET);
+      X9C_DelayUs(5U); /* t_IH HIGH width (>= 1 us) */
+    }
   }
 
-  /* Deselect CS while INC is HIGH to latch position */
-  HAL_GPIO_WritePin(X9C_CS_GPIO_Port, X9C_CS_Pin, GPIO_PIN_SET);
-  X9C_DelayUs(10U); /* t_CPH deselect time (>= 10 us) */
+  /* 4. Datasheet NO-STORE Deselect:
+   * Keep INC LOW while taking CS HIGH to prevent triggering an unwanted 20ms EEPROM write. */
+  X9C_DelayUs(5U); /* t_IC setup time (>= 1 us) */
+  HAL_GPIO_WritePin(X9C_CS_GPIO_Port, X9C_CS_Pin, GPIO_PIN_SET); /* CS HIGH -> Standby (NO STORE) */
+  X9C_DelayUs(5U); /* t_CPH NO-STORE deselect time (>= 100 ns) */
+
+  /* Return INC to idle HIGH */
+  HAL_GPIO_WritePin(X9C_INC_GPIO_Port, X9C_INC_Pin, GPIO_PIN_SET);
+  X9C_DelayUs(10U);
 
   __set_PRIMASK(primask);
 
   s_current_step = 0U;
+  s_target_step = X9C_STEP_28KHZ;
   s_step_increment = DEFAULT_STEP_INCREMENT;
 
   /* Set default frequency (28 kHz -> step 40) directly after reset */
@@ -188,6 +171,8 @@ HAL_StatusTypeDef X9C103S_SetStep(uint8_t target_step)
     target = (uint8_t)(X9C_MAX_STEPS - 1U);
   }
 
+  s_target_step = target;
+
   if (target == s_current_step)
   {
     return HAL_OK;
@@ -198,63 +183,143 @@ HAL_StatusTypeDef X9C103S_SetStep(uint8_t target_step)
 
   if (target > s_current_step)
   {
-    ud_state = GPIO_PIN_SET; /* UP */
+    ud_state = GPIO_PIN_SET; /* UP towards VH */
     count = (uint8_t)(target - s_current_step);
   }
   else
   {
-    ud_state = GPIO_PIN_RESET; /* DOWN */
+    ud_state = GPIO_PIN_RESET; /* DOWN towards VL */
     count = (uint8_t)(s_current_step - target);
   }
 
-  /* 1. Set U/D direction pin and wait setup time (Interrupts unblocked) */
+  /* 1. Set U/D direction pin and wait setup time (t_DI >= 2.9 us) */
   HAL_GPIO_WritePin(X9C_UD_GPIO_Port, X9C_UD_Pin, ud_state);
-  X9C_DelayUs(5U); /* t_ID setup time (>= 2.9 us) */
+  X9C_DelayUs(10U);
 
-  /* 2. Select device (CS LOW) (Interrupts unblocked) */
+  /* 2. Select device (CS LOW) (t_CI >= 100 ns) */
   HAL_GPIO_WritePin(X9C_CS_GPIO_Port, X9C_CS_Pin, GPIO_PIN_RESET);
-  X9C_DelayUs(3U); /* t_CI setup time (>= 100 ns) */
+  X9C_DelayUs(5U);
 
-  /* 3. Send step pulses with per-pulse micro critical sections (<10us blackout per pulse) */
+  /* 3. Send step pulses with per-pulse micro critical sections (<15us blackout per pulse) */
   for (uint8_t i = 0U; i < count; i++)
   {
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
 
+    /* Negative edge (HIGH -> LOW) triggers one wiper step */
     HAL_GPIO_WritePin(X9C_INC_GPIO_Port, X9C_INC_Pin, GPIO_PIN_RESET);
-    X9C_DelayUs(3U); /* t_INC LOW width (>= 1 us) */
-    HAL_GPIO_WritePin(X9C_INC_GPIO_Port, X9C_INC_Pin, GPIO_PIN_SET);
-    X9C_DelayUs(3U); /* t_INC HIGH width (>= 1 us) */
+    X9C_DelayUs(5U); /* t_IL LOW width (>= 1 us) */
+
+    if (i < (count - 1U))
+    {
+      HAL_GPIO_WritePin(X9C_INC_GPIO_Port, X9C_INC_Pin, GPIO_PIN_SET);
+      X9C_DelayUs(5U); /* t_IH HIGH width (>= 1 us) */
+    }
 
     __set_PRIMASK(primask);
   }
 
-  /* 4. Deselect device (CS HIGH while INC is HIGH) to store/latch position (Interrupts unblocked) */
-  HAL_GPIO_WritePin(X9C_CS_GPIO_Port, X9C_CS_Pin, GPIO_PIN_SET);
-  X9C_DelayUs(10U); /* t_CPH deselect time (>= 10 us) */
+  s_total_pulses_sent += count;
+
+  /* 4. Deselect device using DATASHEET NO-STORE MODE:
+   * Keep INC LOW while taking CS HIGH to prevent triggering an unwanted 20ms EEPROM write. */
+  X9C_DelayUs(5U); /* t_IC setup time (>= 1 us) */
+  HAL_GPIO_WritePin(X9C_CS_GPIO_Port, X9C_CS_Pin, GPIO_PIN_SET); /* CS HIGH -> Standby (NO STORE) */
+  X9C_DelayUs(5U); /* t_CPH NO-STORE deselect time (>= 100 ns) */
+
+  /* Return INC to idle HIGH */
+  HAL_GPIO_WritePin(X9C_INC_GPIO_Port, X9C_INC_Pin, GPIO_PIN_SET);
+  X9C_DelayUs(10U);
 
   s_current_step = target;
   return HAL_OK;
 }
 
+HAL_StatusTypeDef X9C103S_StorePosition(void)
+{
+  /* Datasheet Store Mode:
+   * 1. CS LOW with INC HIGH
+   * 2. CS transitions HIGH while INC is HIGH
+   * 3. Must wait t_CPH_STORE (>= 20 ms) before any subsequent operation
+   */
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+
+  HAL_GPIO_WritePin(X9C_INC_GPIO_Port, X9C_INC_Pin, GPIO_PIN_SET);
+  X9C_DelayUs(10U);
+  HAL_GPIO_WritePin(X9C_CS_GPIO_Port, X9C_CS_Pin, GPIO_PIN_RESET);
+  X9C_DelayUs(10U);
+  HAL_GPIO_WritePin(X9C_CS_GPIO_Port, X9C_CS_Pin, GPIO_PIN_SET);
+
+  __set_PRIMASK(primask);
+
+  HAL_Delay(25U); /* 25 ms EEPROM non-volatile write wait (tCPH_STORE >= 20 ms) */
+  return HAL_OK;
+}
+
+uint32_t X9C103S_GetTotalPulsesSent(void)
+{
+  return s_total_pulses_sent;
+}
+
 HAL_StatusTypeDef X9C103S_SetFrequency(uint8_t freq_khz)
 {
+  HAL_StatusTypeDef status;
+
   if (freq_khz == 28U)
   {
-    (void)X9C103S_SetStep(X9C_STEP_28KHZ);
+    status = X9C103S_SetStep(X9C_STEP_28KHZ);
+    if (status != HAL_OK)
+    {
+      return status;
+    }
     s_current_freq = 28U;
+    s_sweep_center_freq = 28U;
     return HAL_OK;
   }
   else if (freq_khz == 40U)
   {
-    (void)X9C103S_SetStep(X9C_STEP_40KHZ);
+    status = X9C103S_SetStep(X9C_STEP_40KHZ);
+    if (status != HAL_OK)
+    {
+      return status;
+    }
     s_current_freq = 40U;
+    s_sweep_center_freq = 40U;
     return HAL_OK;
   }
   else
   {
     return HAL_ERROR;
   }
+}
+
+void PA0_ADC1_Process(void)
+{
+  if (HAL_ADC_Start(&hadc1) == HAL_OK)
+  {
+    if (HAL_ADC_PollForConversion(&hadc1, 2) == HAL_OK)
+    {
+      s_pa0_adc_raw = (uint16_t)HAL_ADC_GetValue(&hadc1);
+      s_pa0_adc_voltage = ((float)s_pa0_adc_raw * 3.30f) / 4095.0f;
+    }
+    HAL_ADC_Stop(&hadc1);
+  }
+}
+
+uint16_t PA0_ADC1_GetLastRaw(void)
+{
+  return s_pa0_adc_raw;
+}
+
+float PA0_ADC1_GetLastVoltage(void)
+{
+  return s_pa0_adc_voltage;
+}
+
+uint8_t X9C103S_GetTargetStep(void)
+{
+  return s_target_step;
 }
 
 void X9C103S_SetSweepEnabled(uint8_t enabled)
@@ -298,12 +363,15 @@ void X9C103S_SetSweepEnabled(uint8_t enabled)
   }
   else
   {
-    s_sweep_enabled = 0U;
-    s_sweep_index = 0U;
-    s_sweep_last_tick = HAL_GetTick();
+    if (s_sweep_enabled != 0U)
+    {
+      s_sweep_enabled = 0U;
+      s_sweep_index = 0U;
+      s_sweep_last_tick = HAL_GetTick();
 
-    /* Always restore exact center frequency when sweep stops. */
-    (void)X9C103S_SetFrequency(s_sweep_center_freq);
+      /* Always restore exact center frequency when sweep stops. */
+      (void)X9C103S_SetFrequency(s_sweep_center_freq);
+    }
   }
 }
 

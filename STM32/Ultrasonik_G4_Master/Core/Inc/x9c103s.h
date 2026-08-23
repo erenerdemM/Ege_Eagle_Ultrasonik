@@ -110,6 +110,41 @@ uint8_t X9C103S_GetCurrentStep(void);
   */
 uint8_t X9C103S_GetCurrentFrequency(void);
 
+/**
+  * @brief  Returns the target wiper step position (0-99).
+  * @retval uint8_t target wiper step.
+  */
+uint8_t X9C103S_GetTargetStep(void);
+
+/**
+  * @brief  Runs PA0 / ADC1 conversion for X9C103S VW analog voltage acquisition.
+  */
+void PA0_ADC1_Process(void);
+
+/**
+  * @brief  Returns latest PA0 / ADC1 raw 12-bit conversion value (0..4095).
+  * @retval uint16_t ADC raw count.
+  */
+uint16_t PA0_ADC1_GetLastRaw(void);
+
+/**
+  * @brief  Returns latest PA0 / ADC1 converted voltage in Volts (0.00V .. 3.30V).
+  * @retval float Voltage in Volts.
+  */
+float PA0_ADC1_GetLastVoltage(void);
+
+/**
+  * @brief  Stores current wiper position into non-volatile EEPROM memory (takes 25 ms).
+  * @retval HAL status.
+  */
+HAL_StatusTypeDef X9C103S_StorePosition(void);
+
+/**
+  * @brief  Returns total cumulative wiper pulses sent since boot.
+  * @retval uint32_t total pulse count.
+  */
+uint32_t X9C103S_GetTotalPulsesSent(void);
+
 #ifdef __cplusplus
 }
 #endif
