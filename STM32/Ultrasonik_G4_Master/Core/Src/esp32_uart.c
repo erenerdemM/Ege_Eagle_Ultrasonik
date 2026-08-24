@@ -372,7 +372,7 @@ static void ProcessLine(const char *line)
 
         if (parsed == 7)
         {
-          /* Software boundary validation */
+          /* Software boundary validation: arbitrary 28..40 kHz support */
           if (dur >= 1u && dur <= 120u &&
               pwr >= 10u && pwr <= 100u &&
               freq >= 28u && freq <= 40u &&
@@ -391,6 +391,7 @@ static void ProcessLine(const char *line)
             g_system_state.degas_config.target_temp_c    = t_target;
 
             X9C103S_SetSweepEnabled(0U);
+            (void)X9C103S_SetFrequency((uint8_t)freq);
             g_system_state.mode = SYS_MODE_DEGAS;
           }
           /* Out-of-bounds parameters are safely rejected without mode change */
@@ -400,6 +401,7 @@ static void ProcessLine(const char *line)
       {
         /* Parameterless command: use existing volatile degas_config defaults */
         X9C103S_SetSweepEnabled(0U);
+        (void)X9C103S_SetFrequency(g_system_state.degas_config.frequency_khz);
         g_system_state.mode = SYS_MODE_DEGAS;
       }
     }

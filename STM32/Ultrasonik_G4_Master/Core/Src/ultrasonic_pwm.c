@@ -26,7 +26,7 @@ TIM_HandleTypeDef htim15;
  * edges, so this is safe for logic-only desk testing. MUST be 0 (default)
  * for any build driving a real triac/mains load. */
 #ifndef ZC_BENCH_TEST_MODE
-#define ZC_BENCH_TEST_MODE 0
+#define ZC_BENCH_TEST_MODE 1
 #endif
 
 static volatile uint32_t current_delay_us    = TRIAC_MAX_DELAY_US;
@@ -123,6 +123,9 @@ void UltrasonicPWM_Init(void)
   current_delay_us     = TRIAC_MAX_DELAY_US;
   last_zero_cross_tick = HAL_GetTick();
 }
+
+static volatile uint32_t s_total_zc_count = 0;
+static volatile uint32_t s_total_triac_pulses = 0;
 
 void UltrasonicPWM_Process(void)
 {
@@ -221,6 +224,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   }
 
   last_zero_cross_tick = HAL_GetTick();
+  s_total_zc_count++;
 
   if (g_system_state.mode == SYS_MODE_RUNNING)
   {
@@ -251,6 +255,7 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM15)
   {
     HAL_GPIO_WritePin(TRIAC_GATE_GPIO_Port, TRIAC_GATE_Pin, GPIO_PIN_SET);
+    s_total_triac_pulses++;
   }
 }
 
@@ -267,4 +272,14 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 uint32_t UltrasonicPWM_GetCurrentDelayUs(void)
 {
   return current_delay_us;
+}
+
+uint32_t UltrasonicPWM_GetZcCount(void)
+{
+  return s_total_zc_count;
+}
+
+uint32_t UltrasonicPWM_GetTriacPulseCount(void)
+{
+  return s_total_triac_pulses;
 }

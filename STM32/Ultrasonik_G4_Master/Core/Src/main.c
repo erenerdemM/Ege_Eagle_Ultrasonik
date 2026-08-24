@@ -479,8 +479,16 @@ static void HIL_DeepDebug_Print(void)
 {
   uint16_t pa0_raw = PA0_ADC1_GetLastRaw();
   uint32_t pa0_mv = ((uint32_t)pa0_raw * 3300U + 2047U) / 4095U;
-  char buf[160];
-  int len = snprintf(buf, sizeof(buf), "DEBUG_STM: PT100_ADC=%lu, PA0_ADC=%u, PA0_V=%lu.%03lu, DELAY=%lu, RELAY=%u, HEATER_OUT=%u, HEATER_FB=%u, TRIAC_OUT=%u, TRIAC_FB=%u\r\n",
+  const char *mode_str = (g_system_state.mode == SYS_MODE_DEGAS) ? "DEGAS" :
+                         ((g_system_state.mode == SYS_MODE_RUNNING) ? "RUNNING" :
+                          ((g_system_state.mode == SYS_MODE_FAULT) ? "FAULT" : "IDLE"));
+  uint8_t current_freq = (g_system_state.mode == SYS_MODE_DEGAS) ? g_system_state.degas_config.frequency_khz : g_system_state.frequency_khz;
+  char buf[250];
+  int len = snprintf(buf, sizeof(buf), "DEBUG_STM: MODE=%s, FREQ=%u, DEGAS_FREQ=%u, X9C_STEP=%u, PT100_ADC=%lu, PA0_ADC=%u, PA0_V=%lu.%03lu, DELAY=%lu, RELAY=%u, HEATER_OUT=%u, HEATER_FB=%u, TRIAC_OUT=%u, TRIAC_FB=%u, ZC_IN=%u, ZC_CNT=%lu, TR_PULSES=%lu\r\n",
+                      mode_str,
+                      (unsigned int)current_freq,
+                      (unsigned int)g_system_state.degas_config.frequency_khz,
+                      (unsigned int)X9C103S_GetTargetStep(),
                       (unsigned long)PT100_ADC_GetLastRaw(),
                       (unsigned int)pa0_raw,
                       (unsigned long)(pa0_mv / 1000U),
@@ -490,7 +498,10 @@ static void HIL_DeepDebug_Print(void)
                       (unsigned int)(HAL_GPIO_ReadPin(HEATER_RELAY_GPIO_Port, HEATER_RELAY_Pin) == GPIO_PIN_SET ? 1 : 0),
                       (unsigned int)(HAL_GPIO_ReadPin(HEATER_TEST_FB_GPIO_Port, HEATER_TEST_FB_Pin) == GPIO_PIN_SET ? 1 : 0),
                       (unsigned int)(HAL_GPIO_ReadPin(TRIAC_GATE_GPIO_Port, TRIAC_GATE_Pin) == GPIO_PIN_SET ? 1 : 0),
-                      (unsigned int)(HAL_GPIO_ReadPin(TRIAC_TEST_FB_GPIO_Port, TRIAC_TEST_FB_Pin) == GPIO_PIN_SET ? 1 : 0));
+                      (unsigned int)(HAL_GPIO_ReadPin(TRIAC_TEST_FB_GPIO_Port, TRIAC_TEST_FB_Pin) == GPIO_PIN_SET ? 1 : 0),
+                      (unsigned int)(HAL_GPIO_ReadPin(ZERO_CROSS_GPIO_Port, ZERO_CROSS_Pin) == GPIO_PIN_SET ? 1 : 0),
+                      (unsigned long)UltrasonicPWM_GetZcCount(),
+                      (unsigned long)UltrasonicPWM_GetTriacPulseCount());
   if (len > 0)
   {
     HAL_UART_Transmit(&hlpuart1, (uint8_t *)buf, (uint16_t)len, 10);

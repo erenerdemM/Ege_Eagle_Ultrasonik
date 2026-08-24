@@ -264,34 +264,35 @@ uint32_t X9C103S_GetTotalPulsesSent(void)
 
 HAL_StatusTypeDef X9C103S_SetFrequency(uint8_t freq_khz)
 {
-  HAL_StatusTypeDef status;
-
-  if (freq_khz == 28U)
-  {
-    status = X9C103S_SetStep(X9C_STEP_28KHZ);
-    if (status != HAL_OK)
-    {
-      return status;
-    }
-    s_current_freq = 28U;
-    s_sweep_center_freq = 28U;
-    return HAL_OK;
-  }
-  else if (freq_khz == 40U)
-  {
-    status = X9C103S_SetStep(X9C_STEP_40KHZ);
-    if (status != HAL_OK)
-    {
-      return status;
-    }
-    s_current_freq = 40U;
-    s_sweep_center_freq = 40U;
-    return HAL_OK;
-  }
-  else
+  if (freq_khz < 28U || freq_khz > 40U)
   {
     return HAL_ERROR;
   }
+
+  /* Linear calibration mapping across 28..40 kHz range (28 kHz -> Step 40, 40 kHz -> Step 90) */
+  uint8_t target_step;
+  if (freq_khz == 28U)
+  {
+    target_step = X9C_STEP_28KHZ; /* Exact Step 40 */
+  }
+  else if (freq_khz == 40U)
+  {
+    target_step = X9C_STEP_40KHZ; /* Exact Step 90 */
+  }
+  else
+  {
+    target_step = (uint8_t)(X9C_STEP_28KHZ + (((uint16_t)(freq_khz - 28U) * 50U + 6U) / 12U));
+  }
+
+  HAL_StatusTypeDef status = X9C103S_SetStep(target_step);
+  if (status != HAL_OK)
+  {
+    return status;
+  }
+
+  s_current_freq = freq_khz;
+  s_sweep_center_freq = freq_khz;
+  return HAL_OK;
 }
 
 void PA0_ADC1_Process(void)

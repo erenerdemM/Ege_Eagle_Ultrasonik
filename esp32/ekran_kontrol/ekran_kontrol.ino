@@ -329,7 +329,7 @@ void degasNvsYukle() {
     service_degas[g].temp_ctrl        = degasPrefs.getUChar((pfx + "tc").c_str(), 0);
     service_degas[g].target_temp_c    = degasPrefs.getFloat((pfx + "tgt").c_str(), 50.0f);
 
-    /* Software boundary validation on load */
+    /* Software boundary validation on load (Arbitrary Frequency 28 kHz .. 40 kHz) */
     if (service_degas[g].duration_minutes < 1 || service_degas[g].duration_minutes > 120) service_degas[g].duration_minutes = 15;
     if (service_degas[g].power_pct < 10 || service_degas[g].power_pct > 100) service_degas[g].power_pct = 100;
     if (service_degas[g].frequency_khz < 28 || service_degas[g].frequency_khz > 40) service_degas[g].frequency_khz = 28;
@@ -1150,15 +1150,14 @@ void komutIsle(String komut) {
   else if (komut == "CMD_STOP") {
     makine_calisiyor[secili_goz] = false;
     degas_active[secili_goz] = false;
-    runtime_sweep[secili_goz] = false;
+    // runtime_sweep[secili_goz] PRESERVED: ARM state maintained across STOP
     if (degas_armed[secili_goz]) {
       durum_metni[secili_goz] = "DEGAS DURDURULDU. START BEKLENIYOR";
     } else {
       durum_metni[secili_goz] = "SISTEM DURDURULDU";
     }
     nextionGonder("t_durum.txt=\"" + durum_metni[secili_goz] + "\"");
-    DEBUG_PRINTLN("--> MOTOR STOP! GÖZ: " + String(secili_goz) + " Durduruldu.");
-    stmSweep(false);
+    DEBUG_PRINTLN("--> MOTOR STOP! GÖZ: " + String(secili_goz) + " Durduruldu (Sweep Armed=" + String(runtime_sweep[secili_goz] ? "YES" : "NO") + ").");
     stmStop();
     if (aktif_sayfa == 0) {
       updatePage0ButtonColors();
@@ -1177,16 +1176,18 @@ void komutIsle(String komut) {
       degas_armed[secili_goz] = false;
       nextionGonder("b_deg.bco=" + String(NEXTION_COLOR_DEFAULT));
     }
-    runtime_sweep[secili_goz] = false;
+    // runtime_sweep[secili_goz] PRESERVED: ARM state maintained across frequency toggle
     int yeni_freq = (stm_freq[secili_goz] == 40) ? 28 : 40;
     stm_freq[secili_goz] = yeni_freq;
     stmSetFreq(yeni_freq);
-    stmSweep(false);
+    if (runtime_sweep[secili_goz]) {
+      stmSweep(true);
+    }
     String freqMetni = (yeni_freq == 40) ? "40k" : "28k";
     nextionGonder("b_freq.txt=\"" + freqMetni + "\"");
     nextionGonder("b_frq.txt=\"" + freqMetni + "\"");
     updatePage0ButtonColors();
-    DEBUG_PRINTLN("--> ESP32: GÖZ " + String(secili_goz) + " FREQ TOGGLED TO " + String(yeni_freq) + " kHz (Sweep Disarmed)");
+    DEBUG_PRINTLN("--> ESP32: GÖZ " + String(secili_goz) + " FREQ TOGGLED TO " + String(yeni_freq) + " kHz (Sweep Armed=" + String(runtime_sweep[secili_goz] ? "YES" : "NO") + ")");
   }
 
   // --- FREKANS SEÇİMİ (28 kHz / 40 kHz) ---
@@ -1203,15 +1204,17 @@ void komutIsle(String komut) {
     if (pipe != -1) {
       int freq = komut.substring(pipe + 1).toInt();
       if (freq == 28 || freq == 40) {
-        runtime_sweep[secili_goz] = false;
+        // runtime_sweep[secili_goz] PRESERVED: ARM state maintained across frequency selection
         stm_freq[secili_goz] = freq;
         stmSetFreq(freq);
-        stmSweep(false);
+        if (runtime_sweep[secili_goz]) {
+          stmSweep(true);
+        }
         String freqMetni = (freq == 40) ? "40k" : "28k";
         nextionGonder("b_freq.txt=\"" + freqMetni + "\"");
         nextionGonder("b_frq.txt=\"" + freqMetni + "\"");
         updatePage0ButtonColors();
-        DEBUG_PRINTLN("--> FREKANS DEĞİŞTİRİLDİ: " + String(freq) + " kHz (Göz: " + String(secili_goz) + ", Sweep Disarmed)");
+        DEBUG_PRINTLN("--> FREKANS DEĞİŞTİRİLDİ: " + String(freq) + " kHz (Göz: " + String(secili_goz) + ", Sweep Armed=" + String(runtime_sweep[secili_goz] ? "YES" : "NO") + ")");
       }
     }
   }
@@ -2298,9 +2301,8 @@ void loop() {
           makine_calisiyor[i] = false;
           degas_active[i] = false;
           degas_armed[i] = false;
-          runtime_sweep[i] = false;
+          // runtime_sweep[i] PRESERVED: ARM state maintained after timer zero
           durum_metni[i] = "YIKAMA TAMAMLANDI!";
-          stmSweep(false);
           stmStop();
           if (i == secili_goz && aktif_sayfa == 0) {
             nextionGonder("b_deg.bco=" + String(NEXTION_COLOR_DEFAULT));

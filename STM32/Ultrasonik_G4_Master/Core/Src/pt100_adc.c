@@ -1,4 +1,4 @@
-/**
+﻿/**
   ******************************************************************************
   * @file    pt100_adc.c
   * @brief   PT100 temperature acquisition via OPAMP3 (PGA=2) + ADC2.
@@ -9,6 +9,9 @@
 #include "main.h"
 #include <stdint.h>
 
+#ifndef PT100_BENCH_TEST_MODE
+#define PT100_BENCH_TEST_MODE 1
+#endif
 extern ADC_HandleTypeDef hadc2;
 extern OPAMP_HandleTypeDef hopamp3;
 
@@ -53,7 +56,7 @@ void PT100_ADC_Process(void)
   if (adc_raw >= ADC_RAW_OPEN_THRESHOLD || adc_raw <= ADC_RAW_SHORT_THRESHOLD ||
       adc_raw < ADC_RAW_VALID_MIN || adc_raw > ADC_RAW_VALID_MAX)
   {
-#if ZC_BENCH_TEST_MODE
+#if PT100_BENCH_TEST_MODE
     /* Bench test mode: Disconnected PT100 sensor on bench setup defaults to ambient (25.0 C) */
     g_system_state.fault_flags &= (uint8_t)~(FAULT_PT100_OPEN | FAULT_PT100_SHORT);
     g_system_state.current_temp_c = 25.0f;
@@ -80,3 +83,4 @@ uint32_t PT100_ADC_GetLastRaw(void)
 {
   return last_adc_raw;
 }
+

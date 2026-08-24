@@ -42,6 +42,8 @@ void TriacForceOff(void);
 
 /* HIL_DEEP_DEBUG: current triac firing delay in microseconds (500=max power, ~9500=min power) */
 uint32_t UltrasonicPWM_GetCurrentDelayUs(void);
+uint32_t UltrasonicPWM_GetZcCount(void);
+uint32_t UltrasonicPWM_GetTriacPulseCount(void);
 
 #ifdef __cplusplus
 }

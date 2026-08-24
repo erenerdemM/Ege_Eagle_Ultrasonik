@@ -64,3 +64,8 @@ backup_stm32/
 
 # STM32 custom reproducible build output
 STM32/*/build-stm32/
+
+# HIL Scratch Scripts, Transient Sessions, and Temp Workspaces
+scratch/
+stm32_workspace_temp/
+x9c_datasheet_extracted.txt
