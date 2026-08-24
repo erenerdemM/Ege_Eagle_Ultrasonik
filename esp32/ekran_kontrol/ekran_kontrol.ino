@@ -97,6 +97,8 @@ int max_goz_sayisi = 3;
 // Tank-scoped service settings
 int guc_seviyesi[MAX_GOZ]; // Power % per tank (10..100%)
 int kart_id[MAX_GOZ];      // Card ID per tank (1..255)
+int heater_mode[MAX_GOZ];  // 0 = RELAY, 1 = SSR per tank
+
 
 // Tank-scoped Sweep configuration
 struct ESP32SweepConfig {
@@ -258,10 +260,12 @@ void nvsYukle() {
     service_sweep[g].span_khz       = prefs.getInt(("sw_sp_" + String(g)).c_str(), 2);
     service_sweep[g].period_ms      = prefs.getInt(("sw_pr_" + String(g)).c_str(), 400);
     service_sweep[g].step_increment = prefs.getInt(("sw_st_" + String(g)).c_str(), 4);
+    heater_mode[g]                  = prefs.getInt(("htr_m_" + String(g)).c_str(), 0);
 
     // Validation bounds
     if (guc_seviyesi[g] < 10 || guc_seviyesi[g] > 100) guc_seviyesi[g] = 50;
     if (kart_id[g] < 1 || kart_id[g] > 255) kart_id[g] = g;
+    if (heater_mode[g] < 0 || heater_mode[g] > 1) heater_mode[g] = 0;
     if (service_sweep[g].span_khz < 1 || service_sweep[g].span_khz > 4) service_sweep[g].span_khz = 2;
     if (service_sweep[g].period_ms < 100 || service_sweep[g].period_ms > 1000) service_sweep[g].period_ms = 400;
     if (service_sweep[g].step_increment < 1 || service_sweep[g].step_increment > 8) service_sweep[g].step_increment = 4;
@@ -288,6 +292,7 @@ void nvsKaydet() {
   for (int g = 1; g < MAX_GOZ; g++) {
     prefs.putInt(("guc_" + String(g)).c_str(), guc_seviyesi[g]);
     prefs.putInt(("kid_" + String(g)).c_str(), kart_id[g]);
+    prefs.putInt(("htr_m_" + String(g)).c_str(), heater_mode[g]);
     prefs.putInt(("sw_en_" + String(g)).c_str(), service_sweep[g].enabled);
     prefs.putInt(("sw_sp_" + String(g)).c_str(), service_sweep[g].span_khz);
     prefs.putInt(("sw_pr_" + String(g)).c_str(), service_sweep[g].period_ms);
@@ -301,10 +306,12 @@ void nvsKaydetGoz(int g) {
   prefs.begin("ultra", false);
   prefs.putInt(("guc_" + String(g)).c_str(), guc_seviyesi[g]);
   prefs.putInt(("kid_" + String(g)).c_str(), kart_id[g]);
+  prefs.putInt(("htr_m_" + String(g)).c_str(), heater_mode[g]);
   prefs.putInt("maxgoz", max_goz_sayisi);
   prefs.end();
-  DEBUG_PRINTLN("DEBUG_ESP32: NVS_SAVE_TANK g=" + String(g) + " guc=" + String(guc_seviyesi[g]) + " id=" + String(kart_id[g]));
+  DEBUG_PRINTLN("DEBUG_ESP32: NVS_SAVE_TANK g=" + String(g) + " guc=" + String(guc_seviyesi[g]) + " id=" + String(kart_id[g]) + " htr_m=" + String(heater_mode[g]));
 }
+
 
 void sweepNvsKaydet(int g) {
   if (g < 1 || g >= MAX_GOZ) return;
@@ -393,6 +400,7 @@ void discardRecipeEditBuffers(int prog = 0) {
 // Page 5 Temporary service edit state (committed to NVS only on PAGE5_SAVE / SRV_SAVE)
 int edit_guc_seviyesi[MAX_GOZ];
 int edit_kart_id[MAX_GOZ];
+int edit_heater_mode[MAX_GOZ];
 int edit_max_goz_sayisi = 3;
 
 // Page 6 Temporary sweep service edit state (committed to NVS only on PAGE6_SAVE / SWP_SAVE)
@@ -406,6 +414,7 @@ void initServiceEditBuffers() {
   for (int g = 1; g < MAX_GOZ; g++) {
     edit_guc_seviyesi[g] = guc_seviyesi[g];
     edit_kart_id[g]      = kart_id[g];
+    edit_heater_mode[g]  = heater_mode[g];
     edit_service_sweep[g]= service_sweep[g];
     edit_service_degas[g]= service_degas[g];
   }
@@ -415,12 +424,14 @@ void discardServiceEditBuffers(int g = 0) {
   if (g >= 1 && g < MAX_GOZ) {
     edit_guc_seviyesi[g] = guc_seviyesi[g];
     edit_kart_id[g]      = kart_id[g];
+    edit_heater_mode[g]  = heater_mode[g];
     edit_service_sweep[g]= service_sweep[g];
     edit_service_degas[g]= service_degas[g];
   } else {
     initServiceEditBuffers();
   }
 }
+
 
 void updatePage0ButtonColors() {
   uint16_t deg_color = (degas_armed[secili_goz] || degas_active[secili_goz]) ? NEXTION_COLOR_GREEN : NEXTION_COLOR_DEFAULT;
@@ -512,17 +523,24 @@ void updatePage5UI(int g) {
   if (g < 1 || g >= MAX_GOZ) return;
   int committed_goz = (kart_id[g] >= 1) ? kart_id[g] : g;
   int draft_id = (edit_kart_id[g] >= 1) ? edit_kart_id[g] : g;
+  String htr_str = (edit_heater_mode[g] == 1) ? "SSR" : "RELAY";
   nextionGonder("t_srv_goz.txt=\"" + String(committed_goz) + "\"");
   nextionGonder("t_srv_guc.txt=\"" + String(edit_guc_seviyesi[g]) + "\"");
   nextionGonder("t_srv_id.txt=\"" + String(draft_id) + "\"");
   nextionGonder("t_srv_max.txt=\"" + String(edit_max_goz_sayisi) + "\"");
+  nextionGonder("t_htr_mode.txt=\"" + htr_str + "\"");
+  nextionGonder("b_htr_mode.txt=\"" + htr_str + "\"");
   // Backward compatibility
   nextionGonder("t0.txt=\"SERVIS AYARLARI - GOZ " + String(committed_goz) + "\"");
   nextionGonder("t_goz_num.txt=\"" + String(g) + "\"");
   nextionGonder("t_guc.txt=\"" + String(edit_guc_seviyesi[g]) + "\"");
   nextionGonder("t_id.txt=\"" + String(draft_id) + "\"");
   nextionGonder("t_max.txt=\"" + String(edit_max_goz_sayisi) + "\"");
+  nextionGonder("t_htr.txt=\"" + htr_str + "\"");
+  nextionGonder("b_htr.txt=\"" + htr_str + "\"");
 }
+
+
 
 void updatePage6UI(int g) {
   if (g < 1 || g >= MAX_GOZ) return;
@@ -755,10 +773,15 @@ void stmSetIdBroadcast(int yeniId) {
   DEBUG_PRINTLN("[ESP->STM] " + log);
 }
 
+void stmSetHeaterMode(int mode) {
+  stmGonder("SET_HEATER_MODE:" + String(mode == 1 ? "SSR" : "RELAY"));
+}
+
 void stmSetpointleriGonder() {
   stmSetTime(hedef_sure[secili_goz]);
   stmSetTemp(hedef_sicaklik[secili_goz]);
   stmSetPower(guc_seviyesi[secili_goz]);
+  stmSetHeaterMode(heater_mode[secili_goz]);
   stmSetStepInc(service_sweep[secili_goz].step_increment);
   stmSetSwpSpan(service_sweep[secili_goz].span_khz);
   stmSetSwpPer(service_sweep[secili_goz].period_ms);
@@ -767,6 +790,7 @@ void stmSetpointleriGonder() {
     stmSweep(true);
   }
 }
+
 
 bool isBusKomut(const String &s) {
   if (s.length() < 3 || s.charAt(0) != 'T') return false;
@@ -1783,6 +1807,19 @@ void komutIsle(String komut) {
     if (edit_max_goz_sayisi > 1) edit_max_goz_sayisi--;
     updatePage5UI(secili_goz);
   }
+  else if (komut == "SRV_HTR_TOGGLE" || komut == "b_htr_mode" || komut == "HEATER_MODE_TOGGLE" ||
+           komut == "PAGE5_HTR_TOGGLE" || komut == "SRV_HTR_MODE" || komut == "HTR_MODE_TOGGLE" ||
+           komut == "b_srv_htr" || komut == "SRV_HTR") {
+    if (!isProvisioningAllowed()) return;
+    service_auth_time = millis();
+    current_service_page = 5;
+    aktif_sayfa = 5;
+    int g = secili_goz;
+    edit_heater_mode[g] = (edit_heater_mode[g] == 1) ? 0 : 1;
+    updatePage5UI(g);
+    DEBUG_PRINTLN("--> ESP32 Page 5 Göz " + String(g) + " Heater Mode=" + String(edit_heater_mode[g] == 1 ? "SSR" : "RELAY"));
+  }
+
 
   // =========================================================================
   // PAGE 6: SWEEP SERVICE SETTINGS (TANK-SCOPED)
@@ -2080,8 +2117,10 @@ void komutIsle(String komut) {
       int old_card_id = kart_id[g];
       int new_card_id = edit_kart_id[g];
       guc_seviyesi[g]  = edit_guc_seviyesi[g];
+      heater_mode[g]   = edit_heater_mode[g];
       service_sweep[g] = edit_service_sweep[g];
       service_degas[g] = edit_service_degas[g];
+
 
       if (new_card_id != old_card_id) {
         kart_id[g] = new_card_id;

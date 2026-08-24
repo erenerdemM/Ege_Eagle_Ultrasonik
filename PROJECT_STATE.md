@@ -20,13 +20,13 @@ Verified Loopbacks: TRIAC (PC6 -> 1k -> PA6), Heater (PB15 -> 1k -> PA4), Zero-C
 
 ## FIRMWARE BASELINE
 
-STM32: STM32G474 HAL-based, TIM15 Triac Phase-Angle PWM (500us..9500us), X9C103S Arbitrary 28..40 kHz Integer Mapping, OPAMP3 PT100 Signal Conditioning, USART3/LPUART1
-ESP32: FreeRTOS Dual-Core C++, Persistent Sweep ARM/ACTIVE Dual-State Architecture, DEGAS Snapshot Frame Pipeline, NVS Flash Storage
-HMI: Nextion HMI Interface (`arayuz.HMI`, `arayuz.tft`, Page 0..Page 8)
+STM32: STM32G474 HAL-based, TIM15 Triac Phase-Angle PWM (500us..9500us), X9C103S Arbitrary 28..40 kHz Integer Mapping, OPAMP3 PT100 Signal Conditioning, Dual-Mode Heater Control (Bang-Bang Mechanical Relay + DC SSR PID / Time-Proportional PWM), USART3/LPUART1
+ESP32: FreeRTOS Dual-Core C++, Persistent Sweep ARM/ACTIVE Dual-State Architecture, DEGAS Snapshot Frame Pipeline, Dual Heater Mode NVS Selection (`htr_m_<g>`), Nextion Page 5 Sync
+HMI: Nextion HMI Interface (`arayuz.HMI`, `arayuz.tft`, Page 0..Page 8, `b_htr_mode` RELAY ↔ SSR Toggle)
 
 ## COMMUNICATION BASELINE
 
-Protocol: Addressable ASCII Protocol Matrix (`T<ID>:SET_POWER:50`, `T<ID>:START_DEGAS:...`, `STAT,<ID>,<MODE>,...`)
+Protocol: Addressable ASCII Protocol Matrix (`T<ID>:SET_POWER:50`, `T<ID>:SET_HEATER_MODE:SSR`, `T<ID>:START_DEGAS:...`, `STAT,<ID>,<MODE>,...`)
 Baudrate: 115200 Baud, 8N1
 Frame Format: Line-terminated (`\n`), Ring-buffered Interrupt Transceiver, Clamping & Checksum Guard
 Node Architecture: Master-Slave Multi-drop (ESP32 Master -> STM32 Slaves ID 1 & ID 2)
@@ -34,10 +34,12 @@ Node Architecture: Master-Slave Multi-drop (ESP32 Master -> STM32 Slaves ID 1 & 
 ## TEST BASELINE
 
 HIL Tests: `test_hil_uart.py` (Pytest Suite for Hardware-in-the-Loop UART Integration)
+Heater Unit Tests: `test_heater_control.py` (133/133 Unit & Plant Simulation Tests Passed)
 HMI Mock: `test_hmi_mock.py` (Nextion Display Protocol Mock Test)
 RS485 Mock: `test_rs485_mock.py` (Multi-drop RS485 Bus Collision & Timing Test)
-HIL Manual & Loopback Audits: Multi-Session Physical Verification PASS (`docs/EAGLEULTRASONIK_SYSTEM_MANIFESTO_V4.md`)
+HIL Manual & Loopback Audits: Dual Heater Session `MANUAL_PAGE5_HEATER_20260824_155742` PASS (1533/1533 Loopback Matches, 0 Mismatch)
 Last Known Test Status: All Mock & Hardware Verification Suites Passed (RUNTIME-PROVEN)
+
 
 ## AUTHORITATIVE DOCUMENTS
 

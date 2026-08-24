@@ -60,6 +60,12 @@ typedef struct
   float    target_temp_c;    /* Target temperature for DEGAS when temp_ctrl == 1 (prototype default: 50.0 °C) */
 } DegasConfig_t;
 
+typedef enum
+{
+  HEATER_MODE_RELAY = 0,
+  HEATER_MODE_SSR   = 1
+} HeaterMode_t;
+
 typedef struct
 {
   /* Setpoints - written by esp32_uart.c on command reception */
@@ -81,10 +87,14 @@ typedef struct
   uint8_t      frequency_khz;
   uint32_t     softstart_delay_us;
 
+  /* Dual-mode heater controller configuration */
+  HeaterMode_t heater_mode;
+
   /* Phase 5.2 Commissioning & Hardware Identification */
   ProvState_t  prov_state;
   char         uid24[25]; /* 24-char upper-case hex string + null terminator */
 } SystemState_t;
+
 
 /* All members are single-word aligned (<=32-bit), so plain volatile reads/writes
  * through this global are atomic on Cortex-M4 without extra locking. */

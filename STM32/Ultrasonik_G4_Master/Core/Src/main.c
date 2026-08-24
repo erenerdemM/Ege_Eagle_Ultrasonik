@@ -25,12 +25,14 @@
 #include "esp32_uart.h"
 #include "pt100_adc.h"
 #include "heater_relay.h"
+#include "heater_control.h"
 #include "ultrasonic_pwm.h"
 #include "process_timer.h"
 #include "x9c103s.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>  // HIL_DEEP_DEBUG: snprintf for the COM11 debug stream
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -483,8 +485,10 @@ static void HIL_DeepDebug_Print(void)
                          ((g_system_state.mode == SYS_MODE_RUNNING) ? "RUNNING" :
                           ((g_system_state.mode == SYS_MODE_FAULT) ? "FAULT" : "IDLE"));
   uint8_t current_freq = (g_system_state.mode == SYS_MODE_DEGAS) ? g_system_state.degas_config.frequency_khz : g_system_state.frequency_khz;
-  char buf[250];
-  int len = snprintf(buf, sizeof(buf), "DEBUG_STM: MODE=%s, FREQ=%u, DEGAS_FREQ=%u, X9C_STEP=%u, PT100_ADC=%lu, PA0_ADC=%u, PA0_V=%lu.%03lu, DELAY=%lu, RELAY=%u, HEATER_OUT=%u, HEATER_FB=%u, TRIAC_OUT=%u, TRIAC_FB=%u, ZC_IN=%u, ZC_CNT=%lu, TR_PULSES=%lu\r\n",
+  const char *htr_mode_str = (g_system_state.heater_mode == HEATER_MODE_SSR) ? "SSR" : "RELAY";
+  unsigned int htr_duty = (unsigned int)HeaterControl_GetDutyPct();
+  char buf[320];
+  int len = snprintf(buf, sizeof(buf), "DEBUG_STM: MODE=%s, FREQ=%u, DEGAS_FREQ=%u, X9C_STEP=%u, PT100_ADC=%lu, PA0_ADC=%u, PA0_V=%lu.%03lu, DELAY=%lu, RELAY=%u, HEATER_OUT=%u, HEATER_FB=%u, TRIAC_OUT=%u, TRIAC_FB=%u, ZC_IN=%u, ZC_CNT=%lu, TR_PULSES=%lu, HTR_MODE=%s, HTR_DUTY=%u\r\n",
                       mode_str,
                       (unsigned int)current_freq,
                       (unsigned int)g_system_state.degas_config.frequency_khz,
@@ -501,12 +505,15 @@ static void HIL_DeepDebug_Print(void)
                       (unsigned int)(HAL_GPIO_ReadPin(TRIAC_TEST_FB_GPIO_Port, TRIAC_TEST_FB_Pin) == GPIO_PIN_SET ? 1 : 0),
                       (unsigned int)(HAL_GPIO_ReadPin(ZERO_CROSS_GPIO_Port, ZERO_CROSS_Pin) == GPIO_PIN_SET ? 1 : 0),
                       (unsigned long)UltrasonicPWM_GetZcCount(),
-                      (unsigned long)UltrasonicPWM_GetTriacPulseCount());
+                      (unsigned long)UltrasonicPWM_GetTriacPulseCount(),
+                      htr_mode_str,
+                      htr_duty);
   if (len > 0)
   {
     HAL_UART_Transmit(&hlpuart1, (uint8_t *)buf, (uint16_t)len, 10);
   }
 }
+
 
 /* USER CODE END 0 */
 
@@ -583,7 +590,7 @@ int main(void)
 
   ESP32_UART_Init();
   PT100_ADC_Init();
-  HeaterRelay_Init();
+  HeaterControl_Init();
   UltrasonicPWM_Init();
   ProcessTimer_Init();
   X9C103S_Init();
@@ -601,9 +608,10 @@ int main(void)
     PT100_ADC_Process();
     PA0_ADC1_Process();
     LPUART1_Process();
-    HeaterRelay_Process();
+    HeaterControl_Process();
     UltrasonicPWM_Process();
     ProcessTimer_Process();
+
 
     /* Check auto-timeout for volatile RAM staging rollback */
     TankId_ProcessStagingTimeout();

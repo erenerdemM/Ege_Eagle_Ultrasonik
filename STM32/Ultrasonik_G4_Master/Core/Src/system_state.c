@@ -5,13 +5,14 @@
   ******************************************************************************
   */
 #include "system_state.h"
-#include "heater_relay.h"
-#include "ultrasonic_pwm.h"
 #include "esp32_uart.h"
+#include "ultrasonic_pwm.h"
+#include "heater_relay.h"
+#include "heater_control.h"
 #include "x9c103s.h"
-#include <stdio.h>
-#include <stddef.h>
+#include "main.h"
 #include <string.h>
+#include <stdio.h>
 
 volatile SystemState_t g_system_state;
 
@@ -94,6 +95,7 @@ void SystemState_Init(void)
   g_system_state.softstart_delay_us = TRIAC_MAX_DELAY_US;
 
   g_system_state.prov_state         = PROV_STATE_UNCOMMISSIONED;
+  g_system_state.heater_mode        = HEATER_MODE_RELAY;
   SystemState_GetUID24((char *)g_system_state.uid24);
 }
 
@@ -144,11 +146,12 @@ void SystemState_SafeStop(StopReason_t reason)
       break;
   }
 
-  /* 2. Cuts Heater Relay OFF immediately (bypassing guard timers) */
-  HeaterRelay_ForceOff();
+  /* 2. Cuts Heater Output (RELAY/SSR) OFF immediately (bypassing guard timers & resetting PID) */
+  HeaterControl_ForceOff();
 
   /* 3. Cuts Triac Gate OFF immediately */
   TriacForceOff();
+
 
   /* 4. Resets softstart ramp state */
   g_system_state.softstart_delay_us = TRIAC_MAX_DELAY_US;

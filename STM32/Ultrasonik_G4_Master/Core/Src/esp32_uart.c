@@ -25,9 +25,11 @@
   */
 #include "esp32_uart.h"
 #include "system_state.h"
+#include "heater_control.h"
 #include "x9c103s.h"
 #include "main.h"
 #include <string.h>
+
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -341,8 +343,33 @@ static void ProcessLine(const char *line)
       g_system_state.setpoint_power_pct = (uint8_t)power;
     }
   }
+  else if (strncmp(cmd, "SET_HEATER_MODE:", 16) == 0)
+  {
+    const char *val = &cmd[16];
+    if (strcmp(val, "SSR") == 0 || strcmp(val, "1") == 0)
+    {
+      HeaterControl_SetMode(HEATER_MODE_SSR);
+      const char *ack_msg = "ACK:HEATER_MODE=SSR\n";
+      RS485_Transmit_Blocking((const uint8_t *)ack_msg, (uint16_t)strlen(ack_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ack_msg, (uint16_t)strlen(ack_msg), 10);
+    }
+    else if (strcmp(val, "RELAY") == 0 || strcmp(val, "0") == 0)
+    {
+      HeaterControl_SetMode(HEATER_MODE_RELAY);
+      const char *ack_msg = "ACK:HEATER_MODE=RELAY\n";
+      RS485_Transmit_Blocking((const uint8_t *)ack_msg, (uint16_t)strlen(ack_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)ack_msg, (uint16_t)strlen(ack_msg), 10);
+    }
+    else
+    {
+      const char *err_msg = "NACK,ERR_INVALID_PARAM\n";
+      RS485_Transmit_Blocking((const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+      HAL_UART_Transmit(&hlpuart1, (const uint8_t *)err_msg, (uint16_t)strlen(err_msg), 10);
+    }
+  }
   else if (strcmp(cmd, "START") == 0)
   {
+
     if (g_system_state.mode == SYS_MODE_FAULT)
     {
       const char *err_msg = "NACK,ERR_FAULT_ACTIVE\n";

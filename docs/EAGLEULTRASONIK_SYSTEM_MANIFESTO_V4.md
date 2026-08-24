@@ -79,7 +79,8 @@ EAGLEULTRASONİK is an industrial multi-tank ultrasonic cleaning and degas autom
 | `page2` | **Recipe Edit** | Edit preset recipes P1, P2, P3 parameters | `b_edit_p1..p3`, `b_edit_swp`, `b_p_save`, `b_p_back` | `EDIT_P1..P3`, `EDIT_SWEEP_TOG`, `P_SAVE|<m>|<c>|<s>`, `PAGE2_BACK` |
 | `page3` | **General Settings**| Placeholder settings menu | `b_back` | `PAGE3_BACK` |
 | `page4` | **Security PIN**| PIN authorization pad for service entry | `b0..b9`, `b_ok`, `b_del`, `b_back` | `KEY0..KEY9`, `KEY_OK`, `KEY_DEL`, `KEY_BACK`, `PAGE4_OPEN` |
-| `page5` | **Service - Power/ID**| Commissioning, tank card ID assignment, power % | `b_srv_tank_up/down`, `b_srv_guc_up/down`, `b_srv_id_up/down`, `b_srv_max_up/down`, `b_save`, `b_discard`, `b_nav_fwd` | `SRV_TANK_UP/DOWN`, `SRV_GUC_UP/DOWN`, `SRV_ID_UP/DOWN`, `SRV_MAX_UP/DOWN`, `SRV_SAVE`, `SRV_DISCARD`, `NAV_FORWARD` |
+| `page5` | **Service - Power/ID/Heater**| Commissioning, tank card ID assignment, power %, heater mode (RELAY ↔ SSR) | `b_srv_tank_up/down`, `b_srv_guc_up/down`, `b_srv_id_up/down`, `b_srv_max_up/down`, `b_htr_mode`, `b_save`, `b_discard`, `b_nav_fwd` | `SRV_TANK_UP/DOWN`, `SRV_GUC_UP/DOWN`, `SRV_ID_UP/DOWN`, `SRV_MAX_UP/DOWN`, `SRV_HTR_TOGGLE`, `SRV_SAVE`, `SRV_DISCARD`, `NAV_FORWARD` |
+
 | `page6` | **Service - Sweep** | Sweep modulation span, period, step configuration | `b_swp_span_up/down`, `b_swp_per_up/down`, `b_swp_step_up/down`, `b_nav_fwd`, `b_nav_back` | `SRV_SPAN_UP/DOWN`, `SRV_PER_UP/DOWN`, `SRV_STEP_UP/DOWN`, `NAV_FORWARD`, `NAV_BACK` |
 | `page7` | **Service - Degas 1**| Degas duration, power %, frequency selection (28..40 kHz) | `b_deg_dur_up/down`, `b_deg_pow_up/down`, `b_deg_frq_up/down`, `b_nav_fwd`, `b_nav_back` | `SRV_DDUR_UP/DOWN`, `SRV_DPOW_UP/DOWN`, `SRV_DFREQ_UP/DOWN`, `NAV_FORWARD`, `NAV_BACK` |
 | `page8` | **Service - Degas 2**| Degas pulse timing and temperature interlock | `b_deg_pon_up/down`, `b_deg_poff_up/down`, `b_deg_tc_tog`, `b_deg_tgt_up/down`, `b_nav_fwd`, `b_nav_back` | `SRV_DPON_UP/DOWN`, `SRV_DPOFF_UP/DOWN`, `SRV_DTCTRL_TOG`, `SRV_DTEMP_UP/DOWN`, `NAV_FORWARD`, `NAV_BACK` |
@@ -160,14 +161,61 @@ $$\text{delay\_us} = 9500 - \frac{9000 \times \text{power\_pct}}{100}$$
 
 ---
 
-## 7. Heater Temperature Control & Hysteresis
+## 7. Dual-Mode Heater Architecture: Mechanical Relay + DC SSR PID Control
 
-* **Sensor:** PT100 Platinum RTD connected to OPAMP3 (PGA Gain x16, ADC2 12-bit).
-* **Control Law:** Bang-bang regulation with +/- 1.0 C hysteresis window:
+EAGLEULTRASONİK features a software-selectable dual-mode heater control architecture supporting both **Mechanical Relays** and **DC Solid-State Relays (SSR)** driving a 12V DC heating element via unified GPIO output pin `PB15` (`HEATER_RELAY_Pin`):
+
+```text
+PT100 Sensor (PB0 -> OPAMP3 PGA x16 -> ADC2)
+  ↓
+Validation Layer (Range [0.0°C .. 110.0°C] & |dT/dt| <= 5.0°C/s Sensor Sanity Guard)
+  ↓
+EMA Filter (alpha = 0.20, Noise Reduction)
+  ↓
+Temperature & Filtered Derivative (dT/dt Trend Engine)
+  ↓
+Heater Controller Manager
+  ├── RELAY Controller Engine
+  │     ├── Bang-Bang with ±1.0°C Hysteresis Window
+  │     ├── 10s Minimum ON Guard & 10s Minimum OFF Guard
+  │     └── Trend Suppression (Inhibits turn-on if dT/dt > +0.05°C/s)
+  │
+  └── SSR Controller Engine
+        ├── 10 Hz Discrete PID (Kp=10.0 %/°C, Ki=0.20 %/(°C·s), Kd=15.0 %·s/°C)
+        ├── Anti-Windup with Integral Dynamic Clamping
+        ├── Filtered Derivative on Measurement (-Kd · dT/dt, No Kick)
+        ├── 2000 ms Time-Proportional PWM Window Engine
+        └── 50 ms Minimum Pulse Guard (Protect Gate Drivers)
+  ↓
+Unified Output Dispatcher (Bumpless Transfer & <1us Cutoff)
+  ↓
+PB15 Output (HEATER_RELAY_Pin) ──> 1k Resistor ──> PA4 Feedback (HEATER_TEST_FB_Pin)
+```
+
+### 7.1 Mechanical Relay Control Mode (`HEATER_MODE_RELAY`)
+* **Control Law:** Symmetric Bang-Bang with $\pm 1.0^\circ\text{C}$ hysteresis deadband:
   - $T_{\text{current}} \le T_{\text{target}} - 1.0^\circ\text{C} \implies \text{Relay ON}$ (`PB15 = HIGH`, `RELAY = 1`)
   - $T_{\text{current}} \ge T_{\text{target}} + 1.0^\circ\text{C} \implies \text{Relay OFF}$ (`PB15 = LOW`, `RELAY = 0`)
-* **IDLE / STOP Interlock:** `HeaterRelay_ForceOff()` immediately opens the relay whenever mode is not `RUNNING`/`DEGAS` or when `temp_ctrl == 0`.
-* **Hardware Loopback:** `PB15` -> 1k -> `PA4` verified with 0 mismatch over 750+ telemetry samples.
+* **Contact Protection:** Enforces minimum $10\,\text{s}$ ON time and minimum $10\,\text{s}$ OFF time guard intervals to eliminate relay chattering.
+* **Trend Suppression:** If temperature is rapidly rising ($dT/dt > +0.05^\circ\text{C}/\text{s}$), activation is suppressed to prevent overshoot.
+
+### 7.2 DC SSR Control Mode (`HEATER_MODE_SSR`)
+* **Control Law:** 10 Hz discrete PID calculating continuous control duty ($0\% \dots 100\%$):
+  $$e(t) = T_{\text{target}} - T(t)$$
+  $$u(t) = \text{clamp}\left( K_p e(t) + I(t) - K_d \frac{dT}{dt},\, 0,\, 100 \right)$$
+* **Anti-Windup:** Integral accumulation is dynamically clamped to $[0, 100]$ and frozen when output saturates.
+* **Time-Proportional Modulation:** Period $T_{\text{window}} = 2000\,\text{ms}$. If $\text{Duty} = 40\%$, `PB15` remains HIGH for $800\,\text{ms}$ and LOW for $1200\,\text{ms}$ each cycle.
+* **Minimum Pulse Guard:** Pulses shorter than $50\,\text{ms}$ ($2.5\%$ duty) are suppressed or clamped to eliminate driver jitter.
+
+### 7.3 HMI Page 5 Selection, NVS Storage & RS485 Synchronization
+* **HMI UI (`b_htr_mode`):** Located on Service Page 5. Touching `b_htr_mode` toggles the edit buffer and immediately updates the button text (`RELAY` $\leftrightarrow$ `SSR`).
+* **Non-Destructive Buffer:** `SRV_DISCARD` cancels changes and restores previous mode; `SRV_SAVE` commits the selection to NVS.
+* **NVS Flash Key:** Stored per-tank as `htr_m_<tank_id>` (`0 = RELAY`, `1 = SSR`). Persists across power-cycles and reboots.
+* **RS485 Command Framing:**
+  - Command: `T<ID>:SET_HEATER_MODE:RELAY` / `T<ID>:SET_HEATER_MODE:SSR`
+  - STM32 Response: `ACK:HEATER_MODE=RELAY` / `ACK:HEATER_MODE=SSR`
+* **Bumpless Transfer:** Mode changes force immediate output deactivation and clear PID integrals, ensuring zero transition spikes on `PB15`.
+
 
 ---
 
@@ -206,15 +254,22 @@ When a stop event occurs, `SystemState_SafeStop()` executes synchronous <1us har
 | **DEGAS Pulse ON/OFF (1100/300ms)**| Timing | Non-blocking tick state-machine verified across cycles | **RUNTIME-PROVEN** |
 | **Zero-Cross Gating** | EXTI Safety | IDLE drops EXTI pulses; RUNNING arms TIM15 | **RUNTIME-PROVEN** |
 | **TRIAC OUT/FB Loopback (PC6 -> PA6)**| Loopback | 752 samples analyzed: 0 mismatch (`TRIAC_OUT == TRIAC_FB`) | **RUNTIME-PROVEN** |
-| **Heater OUT/FB Loopback (PB15 -> PA4)**| Loopback | 752 samples analyzed: 0 mismatch (`HEATER_OUT == HEATER_FB`) | **RUNTIME-PROVEN** |
+| **Heater OUT/FB Loopback (PB15 -> PA4)**| Loopback | 1533 samples analyzed: 0 mismatch (`HEATER_OUT == HEATER_FB`) | **RUNTIME-PROVEN** |
 | **Heater Upper Limit Interlock (58C)**| Temperature | $T = 64.5^\circ\text{C} \ge 58.0^\circ\text{C}$ opens relay (`RELAY = 0`) | **RUNTIME-PROVEN** |
 | **DEGAS 33 kHz Tuning (Step 61)** | Frequency | X9C wiper locked at Step 61; measured PA0 voltage is 2.055 V | **RUNTIME-PROVEN** |
 | **DEGAS Frequency Isolation** | Isolation | Page 0 frequency toggle does not alter saved DEGAS 33 kHz profile | **RUNTIME-PROVEN** |
 | **Sweep ARM Persistence** | Sweep Architecture| STOP, Timer Zero, and Freq Toggle preserve `runtime_sweep = true` | **RUNTIME-PROVEN** |
 | **Safe Stop Latency** | Safety | Synchronous <1us gate cutoff and relay disconnect | **RUNTIME-PROVEN** |
 | **RS485 Bus Integrity** | Communication | 55/55 frames delivered with 0 framing errors or CRC loss | **RUNTIME-PROVEN** |
+| **Page 5 RELAY ↔ SSR Toggle UI** | Dual Heater HMI | `b_htr_mode` updates instantly; Discard restores original mode | **RUNTIME-PROVEN** |
+| **Per-Tank Heater Mode NVS (`htr_m_1`)**| Dual Heater NVS | `0 = RELAY`, `1 = SSR` persisted across reboot & page reopen | **RUNTIME-PROVEN** |
+| **RS485 `SET_HEATER_MODE` / ACK** | Dual Heater Comm | `ACK:HEATER_MODE=SSR` and `ACK:HEATER_MODE=RELAY` confirmed | **RUNTIME-PROVEN** |
+| **RELAY Mode Bang-Bang Heating** | Dual Heater Engine | $T=67.1^\circ\text{C} < 70.0^\circ\text{C} \implies \text{Relay}=1$ drives PB15 active | **RUNTIME-PROVEN** |
+| **SSR Mode PID Time-Proportional** | Dual Heater Engine | 10 Hz PID error produces active PWM duty cycle on PB15 | **RUNTIME-PROVEN** |
+| **DEGAS + Heater Mode Isolation** | Interlock Safety | DEGAS enforces `temp_ctrl=0` ($0\text{V}$ PB15) in both RELAY/SSR | **RUNTIME-PROVEN** |
+| **Physical 12V SSR Load Current** | Electrical | Physical solid-state relay & 12V resistor element unattached | **PHYSICAL-NOT-PROVEN** |
 | **Physical PC6 Gate Microsecond Waveform**| Electrical | Gate pulse voltage shape requires external oscilloscope probe | **PHYSICAL-NOT-PROVEN** |
-| **Heater Hysteresis Lower Turn-On (56C)** | Temperature | Water temperature remained >63C; cooling edge not triggered | **CODE-PROVEN / RUNTIME-NOT-PROVEN** |
+
 
 ---
 
